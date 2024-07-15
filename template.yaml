@@ -38,16 +38,6 @@ Parameters:
     Default: t3.2xlarge
     Description: Instance type to use to launch the head node
 
-  ComputeNodeInstanceType:
-    Type: String
-    Default: m6i.4xlarge
-    Description: Instance type to use to launch the compute node
-
-  ComputeNodeCPUs:
-    Type: Number
-    Default: 16
-    Description: Number of vCPUs for the compute node instance type
-
 Metadata: 
   AWS::CloudFormation::Interface: 
     ParameterGroups: 
@@ -79,10 +69,6 @@ Metadata:
         default: fs-xxxxxxxxxxxxxxxx
       HeadNodeInstanceType: 
         default: Headnode Instance Type
-      ComputeNodeInstanceType: 
-        default: Compute Node Instance Type
-      ComputeNodeCPUs: 
-        default: Compute Node vCPUs
       KeyPair: 
         default: Key Pair
       LatestAmiId: 
@@ -166,6 +152,7 @@ Resources:
                   - ec2:ModifyFleet
                   - ec2:CreateTags
                   - ec2:DescribeInstances
+                  - ec2:DescribeInstanceTypes
                   - ec2:DescribeTags
                   - iam:CreateServiceLinkedRole
                   - fsx:DescribeFileSystems
@@ -304,7 +291,7 @@ Resources:
                     "ResumeTimeout": 480,
                     "SuspendTime": 350,
                     "TreeWidth": 60000,
-                    "GresTypes": "gpu"
+                    "GresTypes": "gres"
                  }
               }
               EOF
@@ -319,10 +306,6 @@ Resources:
                              "NodeGroupName": "node",
                              "MaxNodes": 100,
                              "Region": "${AWS::Region}",
-                             "SlurmSpecifications": {
-                                "CPUs": "${ComputeNodeCPUs}",
-                                "RealMemory": 64000
-                             },
                              "PurchasingOption": "spot",
                              "SpotOptions": {
                                  "AllocationStrategy": "lowest-price",
@@ -334,7 +317,7 @@ Resources:
                              },
                              "LaunchTemplateOverrides": [
                                 {
-                                   "InstanceType": "${ComputeNodeInstanceType}"
+                                   "InstanceType": "m6i.4xlarge"
                                 }
                              ],
                              "SubnetIds": [
@@ -353,10 +336,6 @@ Resources:
                              "NodeGroupName": "node",
                              "MaxNodes": 100,
                              "Region": "${AWS::Region}",
-                             "SlurmSpecifications": {
-                                "CPUs": 48,
-                                "RealMemory": 96000
-                             },
                              "PurchasingOption": "spot",
                              "SpotOptions": {
                                  "AllocationStrategy": "lowest-price",
@@ -396,10 +375,6 @@ Resources:
                              "NodeGroupName": "node",
                              "MaxNodes": 100,
                              "Region": "${AWS::Region}",
-                             "SlurmSpecifications": {
-                                "CPUs": 128,
-                                "RealMemory": 256000
-                             },
                              "PurchasingOption": "on-demand",
                              "SpotOptions": {
                                  "AllocationStrategy": "lowest-price",
@@ -455,6 +430,7 @@ Resources:
               SchedulerType=sched/backfill
               SelectType=select/cons_res
               SelectTypeParameters=CR_Core_Memory
+              DefMemPerCpu=100
               # LOGGING
               SlurmctldDebug=8
               SlurmctldLogFile=/var/log/slurmctld.log

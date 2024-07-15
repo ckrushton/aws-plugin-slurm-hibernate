@@ -95,9 +95,6 @@ def validate_partitions(data):
 
             assert 'Region' in nodegroup, 'Missing "Region" in root["Partitions"][%s]["NodeGroups"][%s]' %(i_partition, i_nodegroup)
 
-            assert 'SlurmSpecifications' in nodegroup, 'Missing "SlurmSpecifications" in root["Partitions"][%s]["NodeGroups"][%s]' %(i_partition, i_nodegroup)
-            assert isinstance(nodegroup['SlurmSpecifications'], dict), 'root["Partitions"][%s]["NodeGroups"][%s]["SlurmSpecifications"] is not a dict' %(i_partition, i_nodegroup)
-
             assert 'PurchasingOption' in nodegroup, 'Missing "PurchasingOption" in root["Partitions"][%s]["NodeGroups"][%s]' %(i_partition, i_nodegroup)
             assert nodegroup['PurchasingOption'] in ('spot', 'on-demand'), 'root["Partitions"][%s]["NodeGroups"][%s]["PurchasingOption"] must be spot or on-demand' %(i_partition, i_nodegroup)
 

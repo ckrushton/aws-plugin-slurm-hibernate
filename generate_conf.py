@@ -35,10 +35,6 @@ with open(slurm_filename, 'w') as f:
             with open(nodegroup_file, "w"):
                 pass
 
-            nodegroup_specs = ()
-            for key, value in nodegroup['SlurmSpecifications'].items():
-                nodegroup_specs += '%s=%s' %(key, value),
-
             # Create an EC2 fleet for this partition.
             # Create the config.
             request_fleet = {
@@ -57,29 +53,61 @@ with open(slurm_filename, 'w') as f:
                 'Type': 'maintain'
             }
 
-            # Populate spot options
+            # Populate spot options.
+            hibernation_required = False
             if 'SpotOptions' in nodegroup:
                 request_fleet['SpotOptions'] = nodegroup['SpotOptions']
+                hibernation_required =  request_fleet['SpotOptions']['InstanceInterruptionBehavior'] == 'hibernate'
 
-            if nodegroup["PurchasingOption"] == "spot":
-                request_fleet['SpotOptions']['InstanceInterruptionBehavior'] = 'hibernate'
-            else:
+            if nodegroup["PurchasingOption"] == "on-demand" and hibernation_required:
+                logger.warning("Hibernation cannot be specified for On-Demand fleet. Setting to 'terminate'")
                 request_fleet['SpotOptions']['InstanceInterruptionBehavior'] = 'terminate'
 
             # Populate on-demand options
             if 'OnDemandOptions' in nodegroup:
                 request_fleet['OnDemandOptions'] = nodegroup['OnDemandOptions']
 
-            # Populate launch configuration overrides. Duplicate overrides for each subnet
+            # Create an EC2 fleet.
+            client = common.get_ec2_client(nodegroup)
+
+            # Determine the resources in this partition automatically based on selected EC2 instances.
+            cpus = []
+            cores = []
+            threading = []
+            mem_mb = []
+
+            # Populate launch configuration overrides. Duplicate overrides for each subnet.
             for override in nodegroup['LaunchTemplateOverrides']:
+                # Parse resources from this instance type.
+                instance_type = override["InstanceType"]
+                try:
+                    response_instances = client.describe_instance_types(InstanceTypes=[instance_type])
+                except Exception as e:
+                    logger.error("Cannot describe EC2 instances in region: %s" % e)
+                    continue
+
+                instance_vcpus = response_instances["InstanceTypes"][0]["VCpuInfo"]["DefaultVCpus"]
+                instance_cores = response_instances["InstanceTypes"][0]["VCpuInfo"]["DefaultCores"]
+                instance_threads_cores = response_instances["InstanceTypes"][0]["VCpuInfo"]["DefaultThreadsPerCore"]
+                instance_memory = response_instances["InstanceTypes"][0]["MemoryInfo"]["SizeInMiB"]
+                instance_hibernation = response_instances["InstanceTypes"][0]["HibernationSupported"]
+
+                cpus.append(instance_vcpus)
+                cores.append(instance_cores)
+                threading.append(instance_threads_cores)
+                mem_mb.append(instance_memory)
+
+                # Sanity check that this instance supports hibernation, if it is specified.
+                if hibernation_required and not instance_hibernation:
+                    logger.error("Instance type %s does not support hibernation, but hibernation is specified for partition %s nodegroup %s" % (instance_type, partition_name, nodegroup_name))
+                    continue
+
                 for subnet in nodegroup['SubnetIds']:
                     override_copy = copy.deepcopy(override)
                     override_copy['SubnetId'] = subnet
                     override_copy['WeightedCapacity'] = 1
                     request_fleet['LaunchTemplateConfigs'][0]['Overrides'].append(override_copy)
 
-            # Create an EC2 fleet.
-            client = common.get_ec2_client(nodegroup)
             try:
                 logger.debug('EC2 CreateFleet request: %s' %json.dumps(request_fleet, indent=4))
                 response_fleet = client.create_fleet(**request_fleet)
@@ -96,7 +124,13 @@ with open(slurm_filename, 'w') as f:
             line = '#EC2_FLEET %s %s %s' % (partition_name, nodegroup_name, fleet_id)
             f.write('%s\n' %line)
             # Write node information.
-            line = 'NodeName=%s State=CLOUD %s' %(nodes, ' '.join(nodegroup_specs))
+            # NOTE: To accomidate a diverse set of instances, use the common (minimum) memory and CPUs across the fleet.
+            min_cpu = min(cpus)
+            min_cores = cores[cpus.index(min_cpu)]
+            min_threads_cores = threading[cpus.index(min_cpu)]
+            min_mem = min(mem_mb)
+            nodegroup_specs = "CPUs=%s Boards=1 SocketsPerBoard=1 CoresPerSocket=%s ThreadsPerCore=%s RealMemory=%s" % (min_cpu, min_cores, min_threads_cores, min_mem)
+            line = 'NodeName=%s State=CLOUD %s' %(nodes, nodegroup_specs)
             f.write('%s\n' %line)
 
         part_options = ()
@@ -116,6 +150,8 @@ with open(gres_filename, 'w') as g:
 
         for nodegroup in partition['NodeGroups']:
             nodes = common.get_node_range(partition, nodegroup)
+            if "SlurmSpecifications" not in nodegroup:
+                continue
             for key, value in nodegroup['SlurmSpecifications'].items():
                 if key.upper() == "GRES":
 
