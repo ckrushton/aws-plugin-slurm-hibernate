@@ -1,9 +1,11 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
+
 import json
+import filelock
+import os
 import sys
 
 import common
-
 
 logger, config, partitions = common.get_common('suspend')
 
@@ -19,46 +21,53 @@ except:
 expanded_hostlist = common.expand_hostlist(hostlist)
 logger.debug('Expanded hostlist: %s' %', '.join(expanded_hostlist))
 
+
 # Parse the expanded hostlist
 nodes_to_suspend = common.parse_node_names(expanded_hostlist)
 logger.debug('Nodes to suspend: %s', json.dumps(nodes_to_suspend, indent=4))
 
+
 for partition_name, nodegroups in nodes_to_suspend.items():
     for nodegroup_name, node_ids in nodegroups.items():
-        
+
         nodegroup = common.get_partition_nodegroup(partition_name, nodegroup_name)
 
-        # Ignore if the partition and the node group are not in partitions.json
-        if nodegroup is None:
-            logger.warning('Skipping partition=%s nodegroup=%s: not in partition.json' %(partition_name, nodegroup_name))
-            continue
+        # Which file contains the nodes currently running in this fleet?
+        nodegroup_folder = config["NodePartitionFolder"]
+        nodegroup_file = nodegroup_folder + os.path.sep + "_".join([partition_name, nodegroup_name, "paritions.txt"])
 
-        client = common.get_ec2_client(nodegroup)
-        
-        # Retrieve the list of instances to terminate based on the tag Name
-        instances_to_terminate = [common.get_node_name(partition_name, nodegroup_name, i) for i in node_ids]
-        try:
-            response_describe = client.describe_instances(
-                Filters=[
-                    {'Name': 'tag:Name', 'Values': instances_to_terminate},
-                    {'Name': 'instance-state-name', 'Values': ['pending', 'running', 'shutting-down', 'stopping', 'stopped']}
-                ]
-            )
-        except Exception as e:
-            logger.critical('Failed to describe instances to terminate - %s' %e)
-        
-        # Terminate each instance
-        for reservation in response_describe['Reservations']:
-            for instance in reservation['Instances']:
-                instance_id = instance['InstanceId']
-                
-                try:
-                    for tag in instance['Tags']:
-                        if tag['Key'] == 'Name':
-                            node_name = tag['Value']
-                            
-                    client.terminate_instances(InstanceIds=[instance_id])
-                    logger.info('Terminated instance %s %s' %(node_name, instance_id))
-                except Exception as e:
-                    logger.info('Failed to terminate instance %s %s' %(node_name, instance_id))
-                
+        # Lock this file to prevent other instances from updating it at the same time,
+        # avoiding a race condition.
+        lockfile = nodegroup_file + ".lock"
+        lock = filelock.FileLock(lockfile)
+        with lock:
+            # Get a list of all nodes currently allocated to this partition.
+            nodes = list()
+            with open(nodegroup_file) as f:
+                for line in f:
+                    line = line.rstrip("\r\n")
+                    nodes.append(line)
+
+            nodes = set(nodes)
+            logger.debug("Existing nodelist for partition %s: %s" % (partition_name, ",".join(nodes)))
+
+            # Obtain the IDs of the nodes to suspend.
+            nodes_to_remove = list(common.get_node_name(partition_name, nodegroup_name, x) for x in node_ids)
+            logger.debug("Suspend nodelist for partition %s: %s" % (partition_name, ",".join(nodes_to_remove)))
+
+            # Remove the nodes to suspended.
+            # Sanity check to ensure these nodes are are actually allocated in this partition.
+            for r_node in nodes_to_remove:
+                if r_node not in nodes:
+                    logger.warning("Node %s cannot be suspended because it is not currently running in partition %s" % (r_node, partition_name))
+                else:
+                    nodes.remove(r_node)
+
+            # Generate a new output file with the updated nodegroup.
+            with open(nodegroup_file, "w") as o:
+                for node in nodes:
+                    o.write(node)
+                    o.write(os.linesep)
+
+        logger.info("Updated nodeset for parition %s" % partition_name)
+

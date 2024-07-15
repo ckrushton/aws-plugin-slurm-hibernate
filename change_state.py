@@ -48,7 +48,7 @@ for line in lines:
         change_state(node_name, 'DOWN', reason='node_stuck')
 
     # If the node is DOWN and in power saving mode, set the node to IDLE
-    if 'DOWN' in node_states and 'POWER' in node_states:
+    if 'DOWN' in node_states and 'POWERED_DOWN' in node_states:
         change_state(node_name, 'IDLE')
 
     # If the node is DOWN but still up, power down the node
