@@ -1,15 +1,15 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: Deploy an example Slurm headnode with the AWS plugin for Slurm (version 2)
+Description: Deploy the slurm infrastructure required to run the SAGAsign bioinformatics workflow
 
 Parameters:
   SlurmPackageUrl:
     Type: String
-    Default: https://download.schedmd.com/slurm/slurm-21.08-latest.tar.bz2
+    Default: https://download.schedmd.com/slurm/slurm-23.02.2.tar.bz2
     Description: URL to the Slurm installation package. The filename must be like slurm-*.tar.bz2
 
   PluginPrefixUrl:
     Type: String
-    Default: https://github.com/aws-samples/aws-plugin-for-slurm/raw/plugin-v2/
+    Default: https://github.com/ckrushton/aws-plugin-slurm-hibernate/raw/hibernate-support
     Description: Path to the plugin files
 
   VpcId:
@@ -18,33 +18,34 @@ Parameters:
 
   Subnet1Id:
     Type: AWS::EC2::Subnet::Id
-    Description: Subnet 1 in the VPC where the headnode and the compute nodes will be launched. Must be a public subnet or a private subnet with a default route to NAT
+    Description: Subnet in the VPC where the headnode and the compute nodes will be launched. Must be a public subnet or a private subnet with a default route to NAT
 
-  Subnet2Id:
-    Type: AWS::EC2::Subnet::Id
-    Description: Subnet 2 in the VPC where the compute nodes will be launched. Must be a public subnet or a private subnet with a default route to NAT
+  LustreID:
+    Type: String
+    Description: Name of the Lustre filesystem to be mounted (should start with fs-)
 
   KeyPair:
     Type: AWS::EC2::KeyPair::KeyName
     Description: Key pair that will be used to launch instances
 
   LatestAmiId:
-    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
-    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+    Type: String
+    Default: ami-07af57b22c5433af3
+    Description: AMI to be used for head node and cluster node creation
 
   HeadNodeInstanceType:
     Type: String
-    Default: c5.large
+    Default: t3.2xlarge
     Description: Instance type to use to launch the head node
 
   ComputeNodeInstanceType:
     Type: String
-    Default: c5.large
+    Default: m6i.4xlarge
     Description: Instance type to use to launch the compute node
 
   ComputeNodeCPUs:
     Type: Number
-    Default: 2
+    Default: 16
     Description: Number of vCPUs for the compute node instance type
 
 Metadata: 
@@ -55,7 +56,7 @@ Metadata:
         Parameters: 
           - VpcId
           - Subnet1Id
-          - Subnet2Id
+          - LustreID
       - Label: 
           default: Instances
         Parameters: 
@@ -74,8 +75,8 @@ Metadata:
         default: VPC ID
       Subnet1Id: 
         default: Subnet 1 ID
-      Subnet2Id: 
-        default: Subnet 2 ID
+      LustreID: 
+        default: fs-xxxxxxxxxxxxxxxx
       HeadNodeInstanceType: 
         default: Headnode Instance Type
       ComputeNodeInstanceType: 
@@ -120,6 +121,16 @@ Resources:
             Principal:
               Service: ec2.amazonaws.com
             Action: sts:AssumeRole
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeTags
+                  - fsx:DescribeFileSystems
+                Resource: '*'
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
 
@@ -147,11 +158,17 @@ Resources:
               - Effect: Allow
                 Action:
                   - ec2:CreateFleet
+                  - ec2:DescribeFleets
+                  - ec2:TerminateFleets
+                  - ec2:DescribeFleetInstances
                   - ec2:RunInstances
                   - ec2:TerminateInstances
+                  - ec2:ModifyFleet
                   - ec2:CreateTags
                   - ec2:DescribeInstances
+                  - ec2:DescribeTags
                   - iam:CreateServiceLinkedRole
+                  - fsx:DescribeFileSystems
                 Resource: '*'
               - Effect: Allow
                 Action: iam:PassRole
@@ -188,20 +205,18 @@ Resources:
           Fn::Base64:
             !Sub |
               #!/bin/bash -x
-              yum install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-7.noarch.rpm
-              yum install munge munge-libs munge-devel -y
 
-              echo "welcometoslurmamazonuserwelcometoslurmamazonuserwelcometoslurmamazonuser" | tee /etc/munge/munge.key
-              chown munge:munge /etc/munge/munge.key
-              chmod 600 /etc/munge/munge.key
-              chown -R munge /etc/munge/ /var/log/munge/
-              chmod 0700 /etc/munge/ /var/log/munge/
-              systemctl enable munge
-              systemctl start munge
-              sleep 15
+              # Load reference files so they are availible in the cache
+              reffiles=$(ls /home/sagasign-resources/references/chm13/*)
+              for reffile in $reffiles; do
+                dd if=$reffile of=/dev/null bs=100M iflag=direct &
+              done
+              sleep 120  # Give the files time to load and cache.
 
-              yum install openssl openssl-devel pam-devel numactl numactl-devel hwloc hwloc-devel lua lua-devel readline-devel rrdtool-devel ncurses-devel man2html libibmad libibumad rpm-build -y
-
+              sudo rm /lib/systemd/system/nfs-common.service
+              systemctl daemon-reload
+              systemctl enable nfs-common
+              systemctl start nfs-common
               mkdir -p /nfs
               mount -t nfs ${HeadNodeNetworkInterface.PrimaryPrivateIpAddress}:/nfs /nfs
               export SLURM_HOME=/nfs/slurm
@@ -210,6 +225,13 @@ Resources:
               'cp' $SLURM_HOME/etc/slurm/slurmd.service /lib/systemd/system
               systemctl enable slurmd.service
               systemctl start slurmd.service
+
+              # Mount Lustre
+              sudo mkdir /aws_fsx
+              export AWS_DEFAULT_REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone | grep -o '[a-z]*-[a-z]*-[0-9]*')
+              lustre_dns=$(aws fsx describe-file-systems --file-system-ids ${LustreID} --output text | grep -o '[0-9a-zA-Z.-]*.amazonaws.com')
+              lustre_name=$(aws fsx describe-file-systems --file-system-ids ${LustreID} --output text | grep LUSTRECONFIGURATION | cut -f 6)
+              sudo mount -t lustre -o relatime,flock $lustre_dns@tcp:/$lustre_name /aws_fsx
 
   HeadNodeInstance:
     Type: AWS::EC2::Instance
@@ -228,45 +250,33 @@ Resources:
           Fn::Base64:
             !Sub |
               #!/bin/bash -x
-              # Install packages
-              yum update -y
-              yum install nfs-utils python2 python2-pip python3 python3-pip -y
-              yum install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-7.noarch.rpm
-              yum install munge munge-libs munge-devel openssl openssl-devel pam-devel numactl numactl-devel hwloc hwloc-devel lua lua-devel readline-devel rrdtool-devel ncurses-devel man2html libibmad libibumad rpm-build libyaml http-parser-devel json-c-devel perl-devel -y
-              yum groupinstall "Development Tools" -y
-              pip3 install boto3
-              pip3 install awscli
+
+              # Load reference files so they are availible in the cache
+              reffiles=$(ls /home/sagasign-resources/references/chm13/*)
+              for reffile in $reffiles; do
+                dd if=$reffile of=/dev/null bs=100M iflag=direct &
+              done
 
               # Configure NFS share
               mkdir -p /nfs
               echo "/nfs *(rw,async,no_subtree_check,no_root_squash)" | tee /etc/exports
-              systemctl enable nfs
-              systemctl start nfs
+              systemctl enable nfs-server
+              systemctl start nfs-server
               exportfs -av
 
-              # Configure Munge
-              echo "welcometoslurmamazonuserwelcometoslurmamazonuserwelcometoslurmamazonuser" | tee /etc/munge/munge.key
-              chown munge:munge /etc/munge/munge.key
-              chmod 600 /etc/munge/munge.key
-              chown -R munge /etc/munge/ /var/log/munge/
-              chmod 0700 /etc/munge/ /var/log/munge/
-              systemctl enable munge
-              systemctl start munge
-              sleep 5
-
               # Install Slurm
-              cd /home/ec2-user/
+              cd /home/ubuntu/
               wget -q ${SlurmPackageUrl}
-              tar -xvf /home/ec2-user/slurm-*.tar.bz2 -C /home/ec2-user
-              cd /home/ec2-user/slurm-*
-              /home/ec2-user/slurm-*/configure --prefix=/nfs/slurm
-              make -j 4
-              make install
-              make install-contrib
+              tar -xvf /home/ubuntu/slurm-*.tar.bz2 -C /home/ubuntu
+              cd /home/ubuntu/slurm-*/
+              /home/ubuntu/slurm-*/configure --prefix=/nfs/slurm
+              make -j 8
+              make install -j 8
+              make install-contrib -j 8
               sleep 5
               export SLURM_HOME=/nfs/slurm
               mkdir -p $SLURM_HOME/etc/slurm
-              'cp' /home/ec2-user/slurm-*/etc/* $SLURM_HOME/etc/slurm
+              'cp' /home/ubuntu/slurm-*/etc/* $SLURM_HOME/etc/slurm
 
               # Install plugin
               mkdir -p $SLURM_HOME/etc/aws
@@ -275,12 +285,14 @@ Resources:
               wget -q ${PluginPrefixUrl}resume.py
               wget -q ${PluginPrefixUrl}suspend.py
               wget -q ${PluginPrefixUrl}generate_conf.py
-              wget -q ${PluginPrefixUrl}change_state.py 
+              wget -q ${PluginPrefixUrl}change_state.py
+              wget -q ${PluginPrefixUrl}fleet_daemon.py 
               chmod +x *.py
 
               cat > $SLURM_HOME/etc/aws/config.json <<EOF
               {
-                 "LogLevel": "INFO",
+                 "LogLevel": "DEBUG",
+                 "NodePartitionFolder": "/nfs/slurm/etc/aws/partitions/",
                  "LogFileName": "/var/log/slurm_plugin.log",
                  "SlurmBinPath": "$SLURM_HOME/bin",
                  "SlurmConf": {
@@ -289,7 +301,7 @@ Resources:
                     "SuspendProgram": "$SLURM_HOME/etc/aws/suspend.py",
                     "ResumeRate": 100,
                     "SuspendRate": 100,
-                    "ResumeTimeout": 300,
+                    "ResumeTimeout": 480,
                     "SuspendTime": 350,
                     "TreeWidth": 60000,
                     "GresTypes": "gpu"
@@ -301,18 +313,20 @@ Resources:
               {
                  "Partitions": [
                     {
-                       "PartitionName": "aws",
+                       "PartitionName": "compm6i",
                        "NodeGroups": [
                           {
                              "NodeGroupName": "node",
                              "MaxNodes": 100,
                              "Region": "${AWS::Region}",
                              "SlurmSpecifications": {
-                                "CPUs": "${ComputeNodeCPUs}"
+                                "CPUs": "${ComputeNodeCPUs}",
+                                "RealMemory": 64000
                              },
-                             "PurchasingOption": "on-demand",
-                             "OnDemandOptions": {
-                                 "AllocationStrategy": "lowest-price"
+                             "PurchasingOption": "spot",
+                             "SpotOptions": {
+                                 "AllocationStrategy": "lowest-price",
+                                 "InstanceInterruptionBehavior": "hibernate"
                              },
                              "LaunchTemplateSpecification": {
                                 "LaunchTemplateId": "${LaunchTemplate}",
@@ -324,8 +338,85 @@ Resources:
                                 }
                              ],
                              "SubnetIds": [
-                                "${Subnet1Id}",
-                                "${Subnet2Id}"
+                                "${Subnet1Id}"
+                             ]
+                          }
+                       ],
+                       "PartitionOptions": {
+                          "Default": "Yes"
+                       }
+                    }, 
+                    {
+                       "PartitionName": "large",
+                       "NodeGroups": [
+                          {
+                             "NodeGroupName": "node",
+                             "MaxNodes": 100,
+                             "Region": "${AWS::Region}",
+                             "SlurmSpecifications": {
+                                "CPUs": 48,
+                                "RealMemory": 96000
+                             },
+                             "PurchasingOption": "spot",
+                             "SpotOptions": {
+                                 "AllocationStrategy": "lowest-price",
+                                 "InstanceInterruptionBehavior": "hibernate"
+                             },
+                             "LaunchTemplateSpecification": {
+                                "LaunchTemplateId": "${LaunchTemplate}",
+                                "Version": "$Latest"
+                             },
+                             "LaunchTemplateOverrides": [
+                                {
+                                    "InstanceType": "c5.12xlarge",
+                                    "Priority": 3.0
+                                },
+                                {
+                                    "InstanceType": "c6i.12xlarge",
+                                    "Priority": 1.0
+                                },
+                                {
+                                    "InstanceType": "c7i.12xlarge",
+                                    "Priority": 2.0
+                                }
+                             ],
+                             "SubnetIds": [
+                                "${Subnet1Id}"
+                             ]
+                          }
+                       ],
+                       "PartitionOptions": {
+                          "Default": "Yes"
+                       }
+                    },
+                    {
+                       "PartitionName": "xlarge",
+                       "NodeGroups": [
+                          {
+                             "NodeGroupName": "node",
+                             "MaxNodes": 100,
+                             "Region": "${AWS::Region}",
+                             "SlurmSpecifications": {
+                                "CPUs": 128,
+                                "RealMemory": 256000
+                             },
+                             "PurchasingOption": "on-demand",
+                             "SpotOptions": {
+                                 "AllocationStrategy": "lowest-price",
+                                 "InstanceInterruptionBehavior": "terminate"
+                             },
+                             "LaunchTemplateSpecification": {
+                                "LaunchTemplateId": "${LaunchTemplate}",
+                                "Version": "$Latest"
+                             },
+                             "LaunchTemplateOverrides": [
+                                {
+                                   "InstanceType":  "c6i.32xlarge",
+                                   "Priority": 3.0
+                                }
+                             ],
+                             "SubnetIds": [
+                                "${Subnet1Id}"
                              ]
                           }
                        ],
@@ -363,11 +454,11 @@ Resources:
               # SCHEDULING
               SchedulerType=sched/backfill
               SelectType=select/cons_res
-              SelectTypeParameters=CR_Core
+              SelectTypeParameters=CR_Core_Memory
               # LOGGING
-              SlurmctldDebug=3
+              SlurmctldDebug=8
               SlurmctldLogFile=/var/log/slurmctld.log
-              SlurmdDebug=3
+              SlurmdDebug=8
               SlurmdLogFile=/var/log/slurmd.log
               DebugFlags=NO_CONF_HASH
               JobCompType=jobcomp/none
@@ -375,6 +466,8 @@ Resources:
               sed -i "s|@HEADNODE@|$HOSTNAME|g" $SLURM_HOME/etc/slurm.conf
 
               # Configure the plugin
+              mkdir -p $SLURM_HOME/etc/aws/partitions/
+              cd $SLURM_HOME/etc/aws/
               $SLURM_HOME/etc/aws/generate_conf.py
               cat $SLURM_HOME/etc/aws/slurm.conf.aws >> $SLURM_HOME/etc/slurm.conf
               cp $SLURM_HOME/etc/aws/gres.conf.aws $SLURM_HOME/etc/gres.conf
@@ -382,6 +475,7 @@ Resources:
               crontab -l > mycron
               cat > mycron <<EOF
               * * * * * $SLURM_HOME/etc/aws/change_state.py &>/dev/null
+              * * * * * $SLURM_HOME/etc/aws/fleet_daemon.py &>/dev/null
               EOF
               crontab mycron
               rm mycron
@@ -390,7 +484,7 @@ Resources:
               cat > $SLURM_HOME/etc/aws/get_nodename <<'EOF'
               instanceid=`/usr/bin/curl --fail -m 2 -s http://169.254.169.254/latest/meta-data/instance-id`
               if [[ ! -z "$instanceid" ]]; then
-                 hostname=`/usr/bin/curl -s http://169.254.169.254/latest/meta-data/tags/instance/Name`
+                 hostname=`aws ec2 describe-tags --region ${AWS::Region} --filters "Name=resource-id,Values=$instanceid" "Name=key,Values=Name" --output text | cut -f5`
               fi
               if [ ! -z "$hostname" -a "$hostname" != "None" ]; then
                  echo $hostname
@@ -436,6 +530,17 @@ Resources:
               WantedBy=multi-user.target
               EOF
 
+              cat > $SLURM_HOME/etc/cgroup.conf <<EOF
+              AllowedRAMSpace=100.0
+              AllowedSwapSpace=0.0
+              ConstrainRAMSpace=yes
+              ConstrainSwapSpace=yes
+              MemorySwappiness=0
+              CgroupAutomount=yes
+              ConstrainCores=yes
+              EOF
+
+
               # Set environment variables
               echo 'export SLURM_HOME=/nfs/slurm' | tee /etc/profile.d/slurm.sh
               echo 'export SLURM_CONF=$SLURM_HOME/etc/slurm.conf' | tee -a /etc/profile.d/slurm.sh
@@ -448,7 +553,21 @@ Resources:
               systemctl enable slurmctld
               systemctl start slurmctld
 
-              /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource HeadNodeInstance --region ${AWS::Region}
+              # Add slurm to bashrc file
+              echo export PATH=$SLURM_HOME/bin:'$PATH' >> /home/ubuntu/.bashrc
+
+              cd /home/ubuntu
+              pip3 install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz
+              pip install boto3 filelock
+
+              # Mount Lustre
+              export AWS_DEFAULT_REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone | grep -o '[a-z]*-[a-z]*-[0-9]*')
+              lustre_dns=$(aws fsx describe-file-systems --file-system-ids ${LustreID} --output text | grep -o '[0-9a-zA-Z.-]*.amazonaws.com')
+              lustre_name=$(aws fsx describe-file-systems --file-system-ids ${LustreID} --output text | grep LUSTRECONFIGURATION | cut -f 6)
+              sudo mkdir /aws_fsx
+              sudo mount -t lustre -o relatime,flock $lustre_dns@tcp:/$lustre_name /aws_fsx
+
+              cfn-signal -e $? --stack ${AWS::StackName} --resource HeadNodeInstance --region ${AWS::Region}
     CreationPolicy:
       ResourceSignal:
         Timeout: PT15M
