@@ -3,6 +3,7 @@
 import copy
 import os
 import json
+import sys
 
 import common
 
@@ -11,6 +12,9 @@ logger, config, partitions = common.get_common('generate_conf')
 
 slurm_filename = 'slurm.conf.aws'
 gres_filename = 'gres.conf.aws'
+
+# We will tag all EC2 fleets with this StackID, to ensure they are cleaned up
+stack_name = sys.argv[1]
 
 # This script generates a file to append to slurm.conf
 with open(slurm_filename, 'w') as f:
@@ -50,7 +54,18 @@ with open(slurm_filename, 'w') as f:
                     'SpotTargetCapacity': 0,
                     'DefaultTargetCapacityType': nodegroup['PurchasingOption']
                 },
-                'Type': 'maintain'
+                'Type': 'maintain',
+                'TagSpecifications': [
+                    {
+                        "ResourceType": "fleet",
+                        "Tags": [
+                            {
+                                "Key": "StackID",
+                                "Value": stack_name
+                            }
+                        ]
+                    }
+                ]
             }
 
             # Populate spot options.
