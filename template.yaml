@@ -9,7 +9,7 @@ Parameters:
 
   PluginPrefixUrl:
     Type: String
-    Default: https://github.com/ckrushton/aws-plugin-slurm-hibernate/raw/hibernate-support
+    Default: https://github.com/ckrushton/aws-plugin-slurm-hibernate/raw/hibernate-support/
     Description: Path to the plugin files
 
   VpcId:
@@ -19,10 +19,6 @@ Parameters:
   Subnet1Id:
     Type: AWS::EC2::Subnet::Id
     Description: Subnet in the VPC where the headnode and the compute nodes will be launched. Must be a public subnet or a private subnet with a default route to NAT
-
-  LustreID:
-    Type: String
-    Description: Name of the Lustre filesystem to be mounted (should start with fs-)
 
   KeyPair:
     Type: AWS::EC2::KeyPair::KeyName
@@ -36,7 +32,7 @@ Parameters:
   HeadNodeInstanceType:
     Type: String
     Default: t3.2xlarge
-    Description: Instance type to use to launch the head node
+    Description: Instance type to use to launch the head node. If the instance has attatched storage, this will be configured as a shared network drive.
 
 Metadata: 
   AWS::CloudFormation::Interface: 
@@ -46,7 +42,6 @@ Metadata:
         Parameters: 
           - VpcId
           - Subnet1Id
-          - LustreID
       - Label: 
           default: Instances
         Parameters: 
@@ -65,8 +60,6 @@ Metadata:
         default: VPC ID
       Subnet1Id: 
         default: Subnet 1 ID
-      LustreID: 
-        default: fs-xxxxxxxxxxxxxxxx
       HeadNodeInstanceType: 
         default: Headnode Instance Type
       KeyPair: 
@@ -169,6 +162,37 @@ Resources:
       Roles:
         - !Ref HeadNodeRole
 
+  CleanupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeFleets
+                  - ec2:TerminateFleets
+                  - ec2:TerminateInstances
+                Resource: '*'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  CleanupRoleProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref CleanupRole
+
   HeadNodeNetworkInterface:
     Type: AWS::EC2::NetworkInterface
     Properties: 
@@ -205,20 +229,16 @@ Resources:
               systemctl enable nfs-common
               systemctl start nfs-common
               mkdir -p /nfs
+              mkdir -p /mnt/scratch/
+              sudo chmod 777 /mnt/scratch/
               mount -t nfs ${HeadNodeNetworkInterface.PrimaryPrivateIpAddress}:/nfs /nfs
+              mount -t nfs ${HeadNodeNetworkInterface.PrimaryPrivateIpAddress}:/mnt/scratch /mnt/scratch
               export SLURM_HOME=/nfs/slurm
 
               mkdir -p /var/spool/slurm
               'cp' $SLURM_HOME/etc/slurm/slurmd.service /lib/systemd/system
               systemctl enable slurmd.service
               systemctl start slurmd.service
-
-              # Mount Lustre
-              sudo mkdir /aws_fsx
-              export AWS_DEFAULT_REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone | grep -o '[a-z]*-[a-z]*-[0-9]*')
-              lustre_dns=$(aws fsx describe-file-systems --file-system-ids ${LustreID} --output text | grep -o '[0-9a-zA-Z.-]*.amazonaws.com')
-              lustre_name=$(aws fsx describe-file-systems --file-system-ids ${LustreID} --output text | grep LUSTRECONFIGURATION | cut -f 6)
-              sudo mount -t lustre -o relatime,flock $lustre_dns@tcp:/$lustre_name /aws_fsx
 
   HeadNodeInstance:
     Type: AWS::EC2::Instance
@@ -244,9 +264,32 @@ Resources:
                 dd if=$reffile of=/dev/null bs=100M iflag=direct &
               done
 
+              # Configure local storage (if availible).
+              mountpoint=/mnt/scratch/
+              mkdir -p $mountpoint
+              sudo chmod 777 $mountpoint
+              fdisk -l
+              localdisks=($(fdisk -l | grep -o '/dev/nvme[0-9]*n[0-9]*' | grep -v nvme0))
+
+              if [[ ${!#localdisks[*]} -gt 0 ]]; then
+                # Local storage present. Do we have multiple drives?
+                if [[ ${!#localdisks[*]} -gt 1 ]]; then
+                  # Multiple drives. Stripe together as RAID 0.
+                  mdadm --create --verbose /dev/md0 --level 0 --raid-devices ${!#localdisks[*]} ${!localdisks[*]}
+                  mountdevice="/dev/md0"
+                else
+                  # Single device.
+                  mountdevice=${!localdisks[0]}
+                fi
+                # Create filesystem and mount
+                mkfs.ext4 -F $mountdevice
+                mount $mountdevice $mountpoint
+              fi
+
               # Configure NFS share
               mkdir -p /nfs
               echo "/nfs *(rw,async,no_subtree_check,no_root_squash)" | tee /etc/exports
+              echo "$mountpoint *(rw,async,no_subtree_check,no_root_squash)" | tee --append /etc/exports
               systemctl enable nfs-server
               systemctl start nfs-server
               exportfs -av
@@ -387,7 +430,7 @@ Resources:
                              "LaunchTemplateOverrides": [
                                 {
                                    "InstanceType":  "c6i.32xlarge",
-                                   "Priority": 3.0
+                                   "Priority": 1.0
                                 }
                              ],
                              "SubnetIds": [
@@ -444,7 +487,7 @@ Resources:
               # Configure the plugin
               mkdir -p $SLURM_HOME/etc/aws/partitions/
               cd $SLURM_HOME/etc/aws/
-              $SLURM_HOME/etc/aws/generate_conf.py ${AWS::StackName}
+              $SLURM_HOME/etc/aws/generate_conf.py ${AWS::StackId}
               cat $SLURM_HOME/etc/aws/slurm.conf.aws >> $SLURM_HOME/etc/slurm.conf
               cp $SLURM_HOME/etc/aws/gres.conf.aws $SLURM_HOME/etc/gres.conf
 
@@ -536,17 +579,66 @@ Resources:
               pip3 install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz
               pip install boto3 filelock
 
-              # Mount Lustre
-              export AWS_DEFAULT_REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone | grep -o '[a-z]*-[a-z]*-[0-9]*')
-              lustre_dns=$(aws fsx describe-file-systems --file-system-ids ${LustreID} --output text | grep -o '[0-9a-zA-Z.-]*.amazonaws.com')
-              lustre_name=$(aws fsx describe-file-systems --file-system-ids ${LustreID} --output text | grep LUSTRECONFIGURATION | cut -f 6)
-              sudo mkdir /aws_fsx
-              sudo mount -t lustre -o relatime,flock $lustre_dns@tcp:/$lustre_name /aws_fsx
-
               cfn-signal -e $? --stack ${AWS::StackName} --resource HeadNodeInstance --region ${AWS::Region}
     CreationPolicy:
       ResourceSignal:
         Timeout: PT15M
+
+  CleanupResources:
+    Type: AWS::Lambda::Function
+    Properties:
+      Role:
+        Fn::GetAtt:
+          - CleanupRole
+          - Arn
+      Code:
+        ZipFile: !Sub |
+
+          import logging
+
+          import boto3
+          from botocore.config import Config
+          from crhelper import CfnResource
+
+          helper = CfnResource(json_logging=False, log_level="INFO", boto_level="ERROR", sleep_on_delete=0)
+          logger = logging.getLogger(__name__)
+          boto3_config = Config(retries={"max_attempts": 60})
+
+          @helper.create
+          @helper.update
+          def no_op(_, __):
+              pass
+
+          @helper.delete
+          def delete(event, _):
+            # Delete all EC2 fleets assocaited with this Stack.
+            session = boto3.session.Session(region_name="${AWS::Region}"")
+            client = session.client('ec2')
+
+            # Get all fleets tagged with this fleet.
+            fleet_filters = [{"Name": "tag:StackID", "Values": ["${AWS::StackId}"]}]
+            describe_resp = client.describe_fleets(Filters=fleet_filters)
+
+            for fleet in describe_resp["Fleets"]:
+              fleet_id = fleet["FleetId"]
+              session.delete_fleets(FleetIds=[fleet_id], TerminateInstances=True)
+
+          def handler(event, context):
+            helper(event, context)
+
+      FunctionName:
+        Fn::Join:
+        - ''
+        - - CleanupResources-
+          - Fn::Select:
+            - 2
+            - Fn::Split:
+              - /
+              - Ref: AWS::StackId
+      Handler: cleanup_resources.handler
+      MemorySize: 128
+      Runtime: python3.9
+      Timeout: 900
 
 Outputs:
   HeadNodeId:
