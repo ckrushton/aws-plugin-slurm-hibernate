@@ -149,6 +149,11 @@ Resources:
                   - ec2:DescribeTags
                   - iam:CreateServiceLinkedRole
                   - fsx:DescribeFileSystems
+                  - s3:GetObject
+                  - s3:GetObjectAttributes
+                  - s3:ListBucket
+                  - s3:PutObject
+
                 Resource: '*'
               - Effect: Allow
                 Action: iam:PassRole
@@ -183,6 +188,8 @@ Resources:
                   - ec2:DescribeFleets
                   - ec2:TerminateFleets
                   - ec2:TerminateInstances
+                  - logs:CreateLogStream
+                  - logs:PutLogEvent
                 Resource: '*'
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
@@ -217,23 +224,17 @@ Resources:
             !Sub |
               #!/bin/bash -x
 
-              # Load reference files so they are availible in the cache
-              reffiles=$(ls /home/sagasign-resources/references/chm13/*)
-              for reffile in $reffiles; do
-                dd if=$reffile of=/dev/null bs=100M iflag=direct &
-              done
-              sleep 120  # Give the files time to load and cache.
-
               sudo rm /lib/systemd/system/nfs-common.service
               systemctl daemon-reload
               systemctl enable nfs-common
               systemctl start nfs-common
               mkdir -p /nfs
-              mkdir -p /mnt/scratch/
-              sudo chmod 777 /mnt/scratch/
+              mkdir -p /shared
+              sudo chmod 777 /shared/
               mount -t nfs ${HeadNodeNetworkInterface.PrimaryPrivateIpAddress}:/nfs /nfs
-              mount -t nfs ${HeadNodeNetworkInterface.PrimaryPrivateIpAddress}:/mnt/scratch /mnt/scratch
+              mount -t nfs ${HeadNodeNetworkInterface.PrimaryPrivateIpAddress}:/shared /shared
               export SLURM_HOME=/nfs/slurm
+              sleep 10
 
               mkdir -p /var/spool/slurm
               'cp' $SLURM_HOME/etc/slurm/slurmd.service /lib/systemd/system
@@ -258,16 +259,10 @@ Resources:
             !Sub |
               #!/bin/bash -x
 
-              # Load reference files so they are availible in the cache
-              reffiles=$(ls /home/sagasign-resources/references/chm13/*)
-              for reffile in $reffiles; do
-                dd if=$reffile of=/dev/null bs=100M iflag=direct &
-              done
-
               # Configure local storage (if availible).
-              mountpoint=/mnt/scratch/
+              mountpoint=/shared/
               mkdir -p $mountpoint
-              sudo chmod 777 $mountpoint
+              chmod 777 $mountpoint
               fdisk -l
               localdisks=($(fdisk -l | grep -o '/dev/nvme[0-9]*n[0-9]*' | grep -v nvme0))
 
@@ -293,6 +288,15 @@ Resources:
               systemctl enable nfs-server
               systemctl start nfs-server
               exportfs -av
+
+              # Load reference files so they are availible in the cache
+              reffiles=$(ls /home/sagasign-resources/references/chm13/*)
+              for reffile in $reffiles; do
+                dd if=$reffile of=/dev/null bs=100M iflag=direct &
+              done
+
+              # Sync to shared filesystem
+              rsync -a /home/sagasign-resources/ /shared/sagasign-resources
 
               # Install Slurm
               cd /home/ubuntu/
