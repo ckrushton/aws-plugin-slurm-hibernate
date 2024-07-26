@@ -153,7 +153,6 @@ Resources:
                   - s3:GetObjectAttributes
                   - s3:ListBucket
                   - s3:PutObject
-
                 Resource: '*'
               - Effect: Allow
                 Action: iam:PassRole
@@ -289,14 +288,11 @@ Resources:
               systemctl start nfs-server
               exportfs -av
 
-              # Load reference files so they are availible in the cache
-              reffiles=$(ls /home/sagasign-resources/references/chm13/*)
-              for reffile in $reffiles; do
-                dd if=$reffile of=/dev/null bs=100M iflag=direct &
-              done
-
-              # Sync to shared filesystem
-              rsync -a /home/sagasign-resources/ /shared/sagasign-resources
+              # As restoring from an EBS snapshot doesn't actually "restore" the files (until they are read)
+              # force read essential files quickly to ensure they are cached.
+              sudo apt install -y parallel
+              reffiles="/home/sagasign-resources/references/"
+              find $reffiles -type f | parallel --jobs 8 dd if={} of=/dev/null bs=10M iflag=direct &
 
               # Install Slurm
               cd /home/ubuntu/
@@ -304,9 +300,9 @@ Resources:
               tar -xvf /home/ubuntu/slurm-*.tar.bz2 -C /home/ubuntu
               cd /home/ubuntu/slurm-*/
               /home/ubuntu/slurm-*/configure --prefix=/nfs/slurm
-              make -j 8
-              make install -j 8
-              make install-contrib -j 8
+              make -j 12
+              make install -j 12
+              make install-contrib -j 12
               sleep 5
               export SLURM_HOME=/nfs/slurm
               mkdir -p $SLURM_HOME/etc/slurm
@@ -583,10 +579,15 @@ Resources:
               pip3 install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz
               pip install boto3 filelock
 
+              # Sync to shared filesystem
+              mkdir -p /shared/sagasign-resources/references/
+              chmod 777 /shared/sagasign-resources/references/
+              cp -r /home/sagasign-resources/references/* /shared/sagasign-resources/references/ &
+
               cfn-signal -e $? --stack ${AWS::StackName} --resource HeadNodeInstance --region ${AWS::Region}
     CreationPolicy:
       ResourceSignal:
-        Timeout: PT15M
+        Timeout: PT20M
 
   CleanupResources:
     Type: AWS::Lambda::Function
@@ -613,7 +614,7 @@ Resources:
       Handler: cleanup_function.handler
       MemorySize: 128
       Runtime: python3.9
-      Timeout: 900
+      Timeout: 60
 
 Outputs:
   HeadNodeId:
