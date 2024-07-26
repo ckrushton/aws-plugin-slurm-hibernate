@@ -596,40 +596,11 @@ Resources:
           - CleanupRole
           - Arn
       Code:
-        ZipFile: !Sub |
-
-          import logging
-
-          import boto3
-          from botocore.config import Config
-          from crhelper import CfnResource
-
-          helper = CfnResource(json_logging=False, log_level="INFO", boto_level="ERROR", sleep_on_delete=0)
-          logger = logging.getLogger(__name__)
-          boto3_config = Config(retries={"max_attempts": 60})
-
-          @helper.create
-          @helper.update
-          def no_op(_, __):
-              pass
-
-          @helper.delete
-          def delete(event, _):
-            # Delete all EC2 fleets assocaited with this Stack.
-            session = boto3.session.Session(region_name="${AWS::Region}"")
-            client = session.client('ec2')
-
-            # Get all fleets tagged with this fleet.
-            fleet_filters = [{"Name": "tag:StackID", "Values": ["${AWS::StackId}"]}]
-            describe_resp = client.describe_fleets(Filters=fleet_filters)
-
-            for fleet in describe_resp["Fleets"]:
-              fleet_id = fleet["FleetId"]
-              session.delete_fleets(FleetIds=[fleet_id], TerminateInstances=True)
-
-          def handler(event, context):
-            helper(event, context)
-
+        ZipFile:
+          Fn::Join:
+            - ""
+            - - !Ref PluginPrefixUrl
+              - "lambda_cleanup_func.zip"
       FunctionName:
         Fn::Join:
         - ''
@@ -639,7 +610,7 @@ Resources:
             - Fn::Split:
               - /
               - Ref: AWS::StackId
-      Handler: cleanup_resources.handler
+      Handler: cleanup_function.handler
       MemorySize: 128
       Runtime: python3.9
       Timeout: 900
