@@ -13,18 +13,8 @@ import common
 logger, config, partitions = common.get_common('resume')
 
 # Obtain a list of all instances assigned to an EC2 fleet.
-def get_fleet_instances(fleet_id, allocation_timeout=90):
+def get_fleet_instances(fleet_id):
 
-    # Wait until the fleet is fufilled and all instances are allocated.
-    logger.debug("Checking for fleet fullfillment %s" % (fleet_id))
-    for i in range(0, allocation_timeout, 5):
-        fleet_response = client.describe_fleets(FleetIds=[fleet_id])
-        fleet_status = fleet_response["Fleets"][0]
-        if "ActivityStatus" in fleet_status and fleet_status["ActivityStatus"] == "fulfilled":
-            break
-        time.sleep(5)
-
-    time.sleep(2)
     # Get a list of instances allocated with this fleet.
     try:
         instance_response = client.describe_fleet_instances(FleetId=fleet_id)
@@ -33,7 +23,7 @@ def get_fleet_instances(fleet_id, allocation_timeout=90):
     except Exception as e:
         logger.error('Failed to describe fleet instances for %s: %s' % (fleet_id, e))
         instances = []
-    
+
     if len(instances) > 0:
         # Filter for instances which are running
         try:
@@ -71,10 +61,8 @@ def get_fleet_region_type(partitions):
     return partition_regions, partition_type
 
 
-def allocate_new_instances(fleet_id, new_instances, orphan_instances, nodes_to_create):
+def allocate_new_instances(fleet_id, new_instances, nodes_to_create):
 
-    instances_created = new_instances
-    instances_created.extend(orphan_instances)
     node_index = 0
     # Alloocate and name the new instances
     if len(new_instances) == 0:
@@ -82,7 +70,7 @@ def allocate_new_instances(fleet_id, new_instances, orphan_instances, nodes_to_c
         pass
     else:
         try:
-            response_describe = client.describe_instances(InstanceIds=instances_created,
+            response_describe = client.describe_instances(InstanceIds=new_instances,
                 Filters=[
                     {'Name': 'instance-state-name', 'Values': ['pending', 'running']}
                 ]
@@ -134,41 +122,44 @@ def allocate_new_instances(fleet_id, new_instances, orphan_instances, nodes_to_c
                     # Update hostsfile with new node IP
                     update_hosts_file(instance_name, ip_address)
 
-                    # Was the allocated instance an existing orphan?
                     try:
-                        orphan_instances.remove(instance_id)
+                        new_instances.remove(instance_id)
                     except ValueError:
                         pass
 
-    return node_index, orphan_instances
+    return node_index, new_instances
 
 
 # Adjust the size of an EC2 Fleet Request.
-# NOTE: This does not check that the command is formatted correctly!
-def adjust_fleet_size(client, fleet_id, command):
+def adjust_fleet_size(client, fleet_id, new_fleet_size):
 
-    logger.debug("Modifying size of fleet %s to %s" % (fleet_id, command))
+    # Obtain the current size of the fleet
     try:
-        expand_fleet_response = client.modify_fleet(FleetId=fleet_id, TargetCapacitySpecification=command, ExcessCapacityTerminationPolicy="no-termination")
-        time.sleep(5)
-        # Wait until the fleet has finished modifying.
-        num_checks = 10
-        for i in range(0, num_checks):
-            fleet_status = client.describe_fleets(FleetIds=[fleet_id])
-            if fleet_status["Fleets"][0]["FleetState"] != "active":
-                # Fleet has finished modifying.
-                time.sleep(3)
-            else:
-                break
-        return True
+        describe_fleet_response = client.describe_fleets(FleetIds=[fleet_id])
+        fleet_size = describe_fleet_response["Fleets"][0]["TargetCapacitySpecification"]
     except Exception as e:
-        logger.error('Failed to update fleet size for %s: %s' % (fleet_id, e))
+        logger.error("Failed to describe fleet %s - %s" % (fleet_id, e))
         return False
+
+    # Compare the current and requested fleet sizes.
+    needs_to_resize = False
+    for instance_type, capacity in new_fleet_size.items():
+        if capacity != fleet_size[instance_type]:
+            needs_to_resize = True
+
+    if needs_to_resize:
+        logger.debug("Modifying size of fleet %s to %s" % (fleet_id, new_fleet_size))
+        try:
+            change_fleet_response = client.modify_fleet(FleetId=fleet_id, TargetCapacitySpecification=new_fleet_size, ExcessCapacityTerminationPolicy="no-termination")
+        except Exception as e:
+            logger.error('Failed to update fleet size for %s: %s' % (fleet_id, e))
+
+    return True
 
 
 # Update /etc/hosts with the IP of this new node
 def update_hosts_file(node_name, ip, hostfile="/etc/hosts"):
-    
+
     lockfile = hostfile + ".lock"
     lock = filelock.FileLock(lockfile, timeout=10)
     try:
@@ -205,7 +196,7 @@ def link_nodes_to_fleet(client, fleet_instances, nodes):
 
     spot_instances = {}
     demand_instances = {}
-    orphan_instances = []
+    new_instances = []
 
     if len(fleet_instances) > 0:
         # Instances are already allocated to these fleets
@@ -234,9 +225,9 @@ def link_nodes_to_fleet(client, fleet_instances, nodes):
                         if tag["Key"] == "Name":
                             instance_name = tag["Value"]
 
-                    # If the instance name or type tag is not set, these nodes were not set up properly
+                    # If the instance name or type tag is not set, these nodes has not yet been configured
                     if instance_name is None:
-                        orphan_instances.append(instance_id)
+                        new_instances.append(instance_id)
                         continue
 
                     # Is this a Spot instance or On-Demand instance?
@@ -244,7 +235,7 @@ def link_nodes_to_fleet(client, fleet_instances, nodes):
                         spot_instances[instance_name] = instance_id
                     else:
                         demand_instances[instance_name] = instance_id
-                        
+
                     # Store the instance ID associated with this node.
                     if instance_name in nodes:
                         nodes[instance_name] = instance_id
@@ -260,7 +251,7 @@ def link_nodes_to_fleet(client, fleet_instances, nodes):
                                     slurm_param = 'nodeaddr=%s nodehostname=%s' %(instance_ip, instance_name)
                                     common.update_node(instance_name, slurm_param)
 
-    return spot_instances, demand_instances, nodes, orphan_instances
+    return spot_instances, demand_instances, nodes, new_instances
 
 
 # Determine which fleet is associated with which partition.
@@ -274,7 +265,7 @@ for partition_name, nodegroups in partition_fleet_ids.items():
         region = partition_regions[partition_name][nodegroup_name]
         fleet_type = partition_type[partition_name][nodegroup_name]
         client = boto3.client('ec2', region_name=region)
-        
+
         # Get the file listing the nodes to run in this partition.
         nodegroup_folder = config["NodePartitionFolder"]
         nodegroup_file = nodegroup_folder + os.path.sep + "_".join([partition_name, nodegroup_name, "paritions.txt"])
@@ -311,7 +302,7 @@ for partition_name, nodegroups in partition_fleet_ids.items():
 
                 # How many instances are currently running with this fleet?
                 fleet_instances = set(get_fleet_instances(fleet_id))
-                spot_instances, demand_instances, nodes, orphan_instances = link_nodes_to_fleet(client, fleet_instances, nodes)
+                spot_instances, demand_instances, nodes, new_instances = link_nodes_to_fleet(client, fleet_instances, nodes)
 
                 num_instances = len(spot_instances) + len(demand_instances)
 
@@ -333,81 +324,52 @@ for partition_name, nodegroups in partition_fleet_ids.items():
                 logger.info("Partition %s currently has %s Spot nodes and %s On Demand nodes in fleet" % (partition_name, len(spot_instances), len(demand_instances)))
                 logger.debug("Partition %s Spot Instances: %s" % (partition_name, ",".join(spot_instances.keys())))
                 logger.debug("Partition %s On-Demand Instances: %s" % (partition_name, ",".join(demand_instances.keys())))
+                logger.debug("Partition %s instances awaiting configuration: %s" % (partition_name, ",".join(new_instances)))
                 logger.info("Partition %s needs to remove %s instances from fleet, and start %s instances" % (partition_name, len(od_to_remove) + len(spot_to_remove), len(nodes_to_create)))
-                if len(orphan_instances) > 0:
-                    logger.debug("Fleet %s has orphan nodes %s" % (fleet_id, ",".join(orphan_instances)))
 
-                # Do we need to change the current fleet allocation?
-                if num_instances != num_nodes or len(demand_instances) != new_demand_target or len(spot_instances) != new_spot_target:
-                    # Shrink the fleet
-                    fleet_command = {"TotalTargetCapacity": num_nodes, "OnDemandTargetCapacity": new_demand_target, "SpotTargetCapacity": new_spot_target}
-                    adjust_fleet_size(client, fleet_id, fleet_command)
+                # Is this fleet already configured?
+                if len(od_to_remove) == 0 and len(spot_to_remove) == 0 and len(nodes_to_create) == 0:
+                    logger.info("Partition %s already fully provisioned" % partition_name)
+                    continue
+
+                # Expand or shrink fleet size, if necessary
+                fleet_command = {"TotalTargetCapacity": num_nodes, "OnDemandTargetCapacity": new_demand_target, "SpotTargetCapacity": new_spot_target}
+                adjust_fleet_size(client, fleet_id, fleet_command)
 
                 # Delete extraneous instances.
                 # On-demand instances.
                 if len(od_to_remove) != 0:
-                    try:            
+                    try:
                         client.terminate_instances(InstanceIds=od_to_remove)
                         logger.info('Terminated on-demand instances %s from fleet %s' % (",".join(od_to_remove), fleet_id))
                     except Exception as e:
                         logger.error('Failed to terminate On-Demand instances in fleet %s - %s' %(fleet_id, e))
-                    time.sleep(5)
+                    time.sleep(1)
                 # Spot instances.
                 if len(spot_to_remove):
-                    try:            
+                    try:
                         client.terminate_instances(InstanceIds=spot_to_remove)
                         logger.info('Terminated spot instances %s from fleet %s' % (",".join(spot_to_remove), fleet_id))
                     except Exception as e:
                         logger.error('Failed to terminate Spot instances in fleet %s - %s' %(fleet_id, e))
-                    time.sleep(5)
+                    time.sleep(1)
 
                 # Allocate new instances.
-                fleet_updated_instances = get_fleet_instances(fleet_id)
-                fleet_new_instances = list(x for x in fleet_updated_instances if x not in fleet_instances)
-
-                # If there are any orphan instances allocated with this fleet, include those as "allocated".
-                num_new_instances, orphan_instances = allocate_new_instances(fleet_id, fleet_new_instances, orphan_instances, nodes_to_create)
-                if fleet_type == "spot":
-                    num_spot_allocated = len(spot_instances) - len(spot_to_remove) + num_new_instances
-                    num_demand_allocated = len(demand_instances) - len(od_to_remove)
+                # NOTE: As this daemon only runs once every minute, these new instances were likely started during previous daemon runs.
+                if len(new_instances) > 0:
+                    num_new_instances, orphan_instances = allocate_new_instances(fleet_id, new_instances, nodes_to_create)
+                    
+                    # Clean up any remaining (overprovisioned) instances
+                    for orphan in orphan_instances:
+                        logger.debug("Terminating orphan instance %s" % orphan)
+                        try:
+                            client.terminate_instances(InstanceIds=[orphan])
+                        except Exception as e:
+                            logger.error('Failed to terminate orphan instance in fleet %s - %s' %(fleet_id, e))
                 else:
-                    num_spot_allocated = len(spot_instances) - len(spot_to_remove)
-                    num_demand_allocated = len(demand_instances) - len(od_to_remove) + num_new_instances
-
-                # Did we allocate enough spot instances to complete the fleet?
-                if num_spot_allocated != new_spot_target:
-                    if fleet_type == "spot":
-                        logger.info("Unable to allocate enough Spot instances for fleet %s" % fleet_id)
-                    # How many nodes are outstanding?
-                    demand_to_create = nodes_to_create[num_new_instances:]
-                    oustanding_num = len(demand_to_create)
-                    # Tweak the fleet to use on-demand nodes instead.
-                    # Now, expand the fleet with additional on-demand instances, removing capacity for spot instances.
-                    fleet_command = {"TotalTargetCapacity": num_nodes, "OnDemandTargetCapacity": new_demand_target + oustanding_num, "SpotTargetCapacity": new_spot_target - oustanding_num}
-                    adjust_fleet_size(client, fleet_id, fleet_command)
-                    # Give the fleet a chance to fill the fleet allocations.
-                    time.sleep(20)
-
-                    # Allocate new On-Demand instances.
-                    fleet_demand_instances = get_fleet_instances(fleet_id)
-                    fleet_new_instances = list(x for x in fleet_demand_instances if x not in fleet_updated_instances)
-                    num_new_demand, orphan_instances = allocate_new_instances(fleet_id, fleet_new_instances, orphan_instances, demand_to_create)
-                    num_demand_allocated = new_demand_target + num_new_demand
-                else:
-                    num_demand_allocated = new_demand_target
-
-                # Clean up any remaining orphan instances
-                for orphan in orphan_instances:
-                    logger.debug("Terminating orphan instance %s" % orphan)
-                    try:            
-                        client.terminate_instances(InstanceIds=[orphan])
-                    except Exception as e:
-                        logger.error('Failed to terminate orphan instance in fleet %s - %s' %(fleet_id, e))
-
-                # Log how many nodes failed to launch
-                nb_failed_nodes = num_nodes - num_demand_allocated - num_spot_allocated
-                if nb_failed_nodes > 0:
-                    logger.warning('Failed to launch %s nodes' %nb_failed_nodes)
+                    logger.debug("No new instances currently allocated to fleet %s. Will check again later" % (fleet_id))
 
         except TimeoutError:
             logger.warning("Failed to process partition %s: Partition is locked" % partition_name)
+
+logger.info("Daemon completed successfully.")

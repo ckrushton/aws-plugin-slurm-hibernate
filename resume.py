@@ -4,6 +4,7 @@ import json
 import filelock
 import os
 import sys
+import time
 
 import common
 
@@ -67,3 +68,6 @@ for partition_name, nodegroups in nodes_to_resume.items():
                     o.write(os.linesep)
 
         logger.info("Updated nodeset for parition %s" % partition_name)
+
+# Give the daemon a chance to allocate nodes.
+time.sleep(60)
