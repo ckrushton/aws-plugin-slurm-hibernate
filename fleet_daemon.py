@@ -289,6 +289,7 @@ for partition_name, nodegroups in partition_fleet_ids.items():
 
                 # Sanity check that the fleet is healthy.
                 # And determine how many nodes have been allocated to this fleet.
+                logger.info("Examining partition %s" % (partition_name))
                 logger.debug('Found fleet ID %s for partition %s' % (fleet_id, partition_name))
                 try:
                     fleet_status_response = client.describe_fleets(FleetIds=[fleet_id])
@@ -321,10 +322,10 @@ for partition_name, nodegroups in partition_fleet_ids.items():
                 # Status messages.
                 logger.info("Partition %s is requesting %s active nodes" % (partition_name, num_nodes))
                 logger.debug("Partition %s active nodes: %s" % (partition_name, ",".join(nodes.keys())))
-                logger.info("Partition %s currently has %s Spot nodes and %s On Demand nodes in fleet" % (partition_name, len(spot_instances), len(demand_instances)))
+                logger.info("Partition %s currently has %s Spot nodes and %s On-Demand nodes in fleet" % (partition_name, len(spot_instances), len(demand_instances)))
                 logger.debug("Partition %s Spot Instances: %s" % (partition_name, ",".join(spot_instances.keys())))
                 logger.debug("Partition %s On-Demand Instances: %s" % (partition_name, ",".join(demand_instances.keys())))
-                logger.debug("Partition %s instances awaiting configuration: %s" % (partition_name, ",".join(new_instances)))
+                logger.debug("Partition %s Instances awaiting configuration: %s" % (partition_name, ",".join(new_instances)))
                 logger.info("Partition %s needs to remove %s instances from fleet, and start %s instances" % (partition_name, len(od_to_remove) + len(spot_to_remove), len(nodes_to_create)))
 
                 # Is this fleet already configured?
@@ -349,9 +350,9 @@ for partition_name, nodegroups in partition_fleet_ids.items():
                 if len(spot_to_remove):
                     try:
                         client.terminate_instances(InstanceIds=spot_to_remove)
-                        logger.info('Terminated spot instances %s from fleet %s' % (",".join(spot_to_remove), fleet_id))
+                        logger.info('Terminated Spot Instances %s from fleet %s' % (",".join(spot_to_remove), fleet_id))
                     except Exception as e:
-                        logger.error('Failed to terminate Spot instances in fleet %s - %s' %(fleet_id, e))
+                        logger.error('Failed to terminate Spot Instances in fleet %s - %s' %(fleet_id, e))
                     time.sleep(1)
 
                 # Allocate new instances.
@@ -367,7 +368,7 @@ for partition_name, nodegroups in partition_fleet_ids.items():
                         except Exception as e:
                             logger.error('Failed to terminate orphan instance in fleet %s - %s' %(fleet_id, e))
                 else:
-                    logger.debug("No new instances currently allocated to fleet %s. Will check again later" % (fleet_id))
+                    logger.debug("No new instances currently allocated to fleet %s. Will check again later." % (fleet_id))
 
         except TimeoutError:
             logger.warning("Failed to process partition %s: Partition is locked" % partition_name)

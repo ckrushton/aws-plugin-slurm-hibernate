@@ -31,7 +31,7 @@ Parameters:
 
   HeadNodeInstanceType:
     Type: String
-    Default: t3.2xlarge
+    Default: i3en.6xlarge
     Description: Instance type to use to launch the head node. If the instance has attatched storage, this will be configured as a shared network drive.
 
 Metadata: 
@@ -233,7 +233,7 @@ Resources:
               mount -t nfs ${HeadNodeNetworkInterface.PrimaryPrivateIpAddress}:/nfs /nfs
               mount -t nfs ${HeadNodeNetworkInterface.PrimaryPrivateIpAddress}:/shared /shared
               export SLURM_HOME=/nfs/slurm
-              sleep 10
+              sleep 20
 
               mkdir -p /var/spool/slurm
               'cp' $SLURM_HOME/etc/slurm/slurmd.service /lib/systemd/system
@@ -332,7 +332,7 @@ Resources:
                     "ResumeRate": 100,
                     "SuspendRate": 100,
                     "ResumeTimeout": 480,
-                    "SuspendTime": 350,
+                    "SuspendTime": 300,
                     "TreeWidth": 60000,
                     "GresTypes": "gres"
                  }
