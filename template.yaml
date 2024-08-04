@@ -26,7 +26,7 @@ Parameters:
 
   LatestAmiId:
     Type: String
-    Default: ami-07af57b22c5433af3
+    Default: ami-0e934cbeb31c90bb7
     Description: AMI to be used for head node and cluster node creation
 
   HeadNodeInstanceType:
@@ -138,6 +138,7 @@ Resources:
                 Action:
                   - ec2:CreateFleet
                   - ec2:DescribeFleets
+                  - ec2:DeleteFleets
                   - ec2:TerminateFleets
                   - ec2:DescribeFleetInstances
                   - ec2:RunInstances
@@ -148,7 +149,6 @@ Resources:
                   - ec2:DescribeInstanceTypes
                   - ec2:DescribeTags
                   - iam:CreateServiceLinkedRole
-                  - fsx:DescribeFileSystems
                   - s3:GetObject
                   - s3:GetObjectAttributes
                   - s3:ListBucket
@@ -290,7 +290,6 @@ Resources:
 
               # As restoring from an EBS snapshot doesn't actually "restore" the files (until they are read)
               # force read essential files quickly to ensure they are cached.
-              sudo apt install -y parallel
               reffiles="/home/sagasign-resources/references/"
               find $reffiles -type f | parallel --jobs 8 dd if={} of=/dev/null bs=10M iflag=direct &
 
@@ -360,7 +359,12 @@ Resources:
                              },
                              "LaunchTemplateOverrides": [
                                 {
-                                   "InstanceType": "m6i.4xlarge"
+                                   "InstanceType": "m6i.4xlarge",
+                                   "Priority": 1.0
+                                },
+                                {
+                                   "InstanceType": "m7i.4xlarge",
+                                   "Priority": 2.0
                                 }
                              ],
                              "SubnetIds": [
@@ -400,6 +404,14 @@ Resources:
                                 {
                                     "InstanceType": "c7i.12xlarge",
                                     "Priority": 2.0
+                                },
+                                {
+                                    "InstanceType": "c6a.12xlarge",
+                                    "Priority": 4.0
+                                },
+                                {
+                                    "InstanceType": "c7a.12xlarge",
+                                    "Priority": 5.0
                                 }
                              ],
                              "SubnetIds": [
@@ -416,7 +428,7 @@ Resources:
                        "NodeGroups": [
                           {
                              "NodeGroupName": "node",
-                             "MaxNodes": 100,
+                             "MaxNodes": 4,
                              "Region": "${AWS::Region}",
                              "PurchasingOption": "on-demand",
                              "SpotOptions": {
@@ -575,10 +587,6 @@ Resources:
               # Add slurm to bashrc file
               echo export PATH=$SLURM_HOME/bin:'$PATH' >> /home/ubuntu/.bashrc
 
-              cd /home/ubuntu
-              pip3 install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz
-              pip install boto3 filelock
-
               # Sync to shared filesystem
               mkdir -p /shared/sagasign-resources/references/
               chmod 777 /shared/sagasign-resources/references/
@@ -587,7 +595,7 @@ Resources:
               cfn-signal -e $? --stack ${AWS::StackName} --resource HeadNodeInstance --region ${AWS::Region}
     CreationPolicy:
       ResourceSignal:
-        Timeout: PT20M
+        Timeout: PT25M
 
   CleanupResources:
     Type: AWS::Lambda::Function
