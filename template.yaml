@@ -108,7 +108,6 @@ Resources:
               - Effect: Allow
                 Action:
                   - ec2:DescribeTags
-                  - fsx:DescribeFileSystems
                 Resource: '*'
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
@@ -139,7 +138,6 @@ Resources:
                   - ec2:CreateFleet
                   - ec2:DescribeFleets
                   - ec2:DeleteFleets
-                  - ec2:TerminateFleets
                   - ec2:DescribeFleetInstances
                   - ec2:RunInstances
                   - ec2:TerminateInstances
@@ -185,8 +183,9 @@ Resources:
               - Effect: Allow
                 Action:
                   - ec2:DescribeFleets
-                  - ec2:TerminateFleets
                   - ec2:TerminateInstances
+                  - ec2:DeleteFleets
+                  - logs:CreateLogGroup
                   - logs:CreateLogStream
                   - logs:PutLogEvent
                 Resource: '*'
@@ -606,10 +605,33 @@ Resources:
           - Arn
       Code:
         ZipFile:
-          Fn::Join:
-            - ""
-            - - !Ref PluginPrefixUrl
-              - "lambda_cleanup_func.zip"
+          !Sub |
+            import boto3
+            import cfnresponse
+            import os
+
+            def delete():
+              # Delete all EC2 fleets assocaited with this Stack.
+              region = os.environ["AWS_REGION"]
+              session = boto3.session.Session(region_name=region)
+              client = session.client("ec2")
+
+              # Get all fleets tagged with this fleet.
+              fleet_filters = [{"Name": "tag:StackID", "Values": ["${AWS::StackId}"]}]
+              describe_resp = client.describe_fleets(Filters=fleet_filters)
+
+              for fleet in describe_resp["Fleets"]:
+                fleet_id = fleet["FleetId"]
+                client.delete_fleets(FleetIds=[fleet_id], TerminateInstances=True)
+
+            def handler(event, context):
+
+              response = {}
+              if event["RequestType"] == "Delete":
+                delete()
+                response["output"] = "EC2 fleets deleted"
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, response)
+
       FunctionName:
         Fn::Join:
         - ''
@@ -619,10 +641,18 @@ Resources:
             - Fn::Split:
               - /
               - Ref: AWS::StackId
-      Handler: cleanup_function.handler
+      Handler: index.handler
       MemorySize: 128
       Runtime: python3.9
       Timeout: 60
+
+  OnStackDeletion:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken:
+        Fn::GetAtt:
+          - CleanupResources
+          - Arn
 
 Outputs:
   HeadNodeId:
