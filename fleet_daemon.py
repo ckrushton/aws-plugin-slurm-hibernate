@@ -3,6 +3,7 @@
 # Adapted from https://github.com/aws-samples/aws-plugin-for-slurm
 
 import boto3
+import datetime
 import filelock
 import json
 import os
@@ -11,6 +12,7 @@ import time
 import common
 
 logger, config, partitions = common.get_common('resume')
+daemon_start_time = datetime.datetime.now()
 
 # Obtain a list of all instances assigned to an EC2 fleet.
 def get_fleet_instances(fleet_id):
@@ -34,7 +36,9 @@ def get_fleet_instances(fleet_id):
             if len(response_describe["Reservations"]) > 0:
                 for reservation in response_describe["Reservations"]:
                     for instance_info in reservation["Instances"]:
-                        instances.append(instance_info["InstanceId"])
+
+                        instance_id = instance_info["InstanceId"]
+                        instances.append(instance_id)
         except Exception as e:
             logger.critical('Failed to describe instances in fleet %s - %s' % (fleet_id, e))
             instances = []
@@ -130,8 +134,89 @@ def allocate_new_instances(fleet_id, new_instances, nodes_to_create):
     return node_index, new_instances
 
 
+# Check a fleet history to determine if we have been waiting on new instances for a prolonged period of time
+def spot_allocation_timeout(client, fleet_id, timeout_seconds=300):
+
+    # Check the fleet history from a minute ago, to ensure all the events have been updated
+    start_time = daemon_start_time - datetime.timedelta(seconds=timeout_seconds)
+
+    start_time = '{:%Y-%m-%dT%H:%M:00Z}'.format(start_time)
+
+    # Sanity check that this fleet is not stuck modifying.
+    # This can occur if the fleet is blacklisted, and we don't want to make the situation worse.
+    try:
+        describe_fleet_response = client.describe_fleets(FleetIds=[fleet_id])
+        fleet_info = describe_fleet_response["Fleets"][0]
+    except Exception as e:
+        logger.error("Failed to describe fleet %s - %s" % (fleet_id, e))
+        return False
+
+    # Is the fleet is currently being edited?
+    if fleet_info["FleetState"] == "modifying":
+        return False
+
+    try:
+        fleet_history = client.describe_fleet_history(FleetId=fleet_id, StartTime=start_time)
+    except Exception as e:
+        logger.error("Failed to describe fleet history %s - %s" % (fleet_id, e))
+        return False  # Assume the fleet has not timed out, as we cannot check it.
+
+    # Remove periodic stop bid updates.
+    fleet_events = list(x for x in fleet_history["HistoryRecords"] if x["EventType"] != "spotInstanceRequestChange")
+
+    # Check to see if there have been any updates to the fleet in the prescribed period of time.
+    if len(fleet_events) == 0:
+       logger.warning("Fleet %s has not been updated for more than %s seconds, despite requesting additional capacity" % (fleet_id, timeout_seconds))
+       # No events.
+       return True
+
+    # Is the most recent event warning about spot capacity?
+    last_record = fleet_events[-1]
+    if last_record["EventType"] == "error":
+        last_record_event = last_record["EventInformation"]["EventSubType"]
+        if last_record_event == "spotInstanceCountLimitExceeded" or last_record_event == "spotFleetRequestConfigurationInvalid":
+            # We are out of spot capacity.
+            logger.warning("Fleet %s is out of spot capacity - %s" % (fleet_id, last_record_event))
+            return True
+        if last_record_event == "allLaunchSpecsTemporarilyBlacklisted":
+            # We have not been very elegant, and there have been repeted problems launching instances.
+            # We have been blacklisted for a few minutes.
+            logger.warning("Fleet %s is currently blacklisted and will not be further modified - %s" % (fleet_id, last_record))
+
+    return False
+
+
+# Convert any unallocated spot capacity to on-demand capacity.
+def spot_fallback_to_demand(client, fleet_id, target_capacity):
+
+    # Get the instances currently assigned to this fleet
+    fleet_instances = get_fleet_instances(fleet_id)
+
+    # How many spot instances are allocated?
+    try:
+        describe_response = client.describe_instances(InstanceIds=fleet_instances, Filters=[
+                    {'Name': 'instance-state-name', 'Values': ['pending', 'running']},
+                    {"Name": "instance-lifecycle", "Values": ["spot"]}
+                ])
+    except Exception as e:
+        logger.warning("Unable to describe spot instances in fleet %s - %s" % (fleet_id, e))
+
+    num_spot_allocated = len(describe_response["Reservations"])
+
+    # How many additional On-Demand instances should we request?
+    target_od = target_capacity - num_spot_allocated
+
+    # Adjust the size of the requested fleet
+    fleet_command = {"TotalTargetCapacity": target_capacity, "OnDemandTargetCapacity": num_spot_allocated, "SpotTargetCapacity": target_od}
+    logger.debug("Modifying size of fleet %s to %s" % (fleet_id, fleet_command))
+    try:
+        change_fleet_response = client.modify_fleet(FleetId=fleet_id, TargetCapacitySpecification=fleet_command, ExcessCapacityTerminationPolicy="no-termination")
+    except Exception as e:
+        logger.error('Failed to update fleet size for %s: %s' % (fleet_id, e))
+
+
 # Adjust the size of an EC2 Fleet Request.
-def adjust_fleet_size(client, fleet_id, new_fleet_size):
+def adjust_fleet_size(client, fleet_id, target_size, num_od_remove, fleet_type):
 
     # Obtain the current size of the fleet
     try:
@@ -141,18 +226,29 @@ def adjust_fleet_size(client, fleet_id, new_fleet_size):
         logger.error("Failed to describe fleet %s - %s" % (fleet_id, e))
         return False
 
-    # Compare the current and requested fleet sizes.
-    needs_to_resize = False
-    for instance_type, capacity in new_fleet_size.items():
-        if capacity != fleet_size[instance_type]:
-            needs_to_resize = True
+    # Do we need to adjust the size of the fleet?
+    if target_size == fleet_size["TotalTargetCapacity"] and num_od_remove == 0:
+        return True
+    
+    # Need to resize the fleet.
+    # Is this a spot fleet on on-demand?
+    od_capacity = fleet_size["OnDemandTargetCapacity"]
+    if fleet_type == "spot":
+        # As this is a spot fleet, if there are On-Demand instances allocated (as a fallback) which need to be shut down
+        # reduce the allocation of On-Demand instances accordingly
+        on_demand_target = od_capacity - num_od_remove
+        fleet_command = {"TotalTargetCapacity": num_nodes, "OnDemandTargetCapacity": on_demand_target, "SpotTargetCapacity": num_nodes - on_demand_target}
+    else:  # On-demand.
+        # NOTE: We shouldn't have spot instances in an On-Demand fleet (as we won't fall back to spot instances if On-Demand can't be allocated!),
+        # so this is a lot simplier than handling spot fleets.
+        # Just set the capacity to the target capacity.
+        fleet_command = {"TotalTargetCapacity": num_nodes, "OnDemandTargetCapacity": num_nodes, "SpotTargetCapacity": 0}
 
-    if needs_to_resize:
-        logger.debug("Modifying size of fleet %s to %s" % (fleet_id, new_fleet_size))
-        try:
-            change_fleet_response = client.modify_fleet(FleetId=fleet_id, TargetCapacitySpecification=new_fleet_size, ExcessCapacityTerminationPolicy="no-termination")
-        except Exception as e:
-            logger.error('Failed to update fleet size for %s: %s' % (fleet_id, e))
+    logger.debug("Modifying size of fleet %s to %s" % (fleet_id, fleet_command))
+    try:
+        change_fleet_response = client.modify_fleet(FleetId=fleet_id, TargetCapacitySpecification=fleet_command, ExcessCapacityTerminationPolicy="no-termination")
+    except Exception as e:
+        logger.error('Failed to update fleet size for %s: %s' % (fleet_id, e))
 
     return True
 
@@ -188,7 +284,7 @@ def update_hosts_file(node_name, ip, hostfile="/etc/hosts"):
     except TimeoutError:
         logger.info("Unable to update hostfile %s: File locked" % hostfile)
     except Exception as e:
-        logger.warn("Unable to updat hostfile %s - %s" % (hostfile, e))
+        logger.warning("Unable to update hostfile %s - %s" % (hostfile, e))
 
 
 # Compare the nodes that are currently running to those present in the fleet, and determine what chages are required.
@@ -312,12 +408,6 @@ for partition_name, nodegroups in partition_fleet_ids.items():
                 spot_to_remove = list(y for x, y in spot_instances.items() if x not in nodes)
                 # Find which new instances need to be allocated.
                 nodes_to_create = list(x for x, y in nodes.items() if y is None)
-                if fleet_type == "spot":
-                    new_demand_target = len(demand_instances) - len(od_to_remove)
-                    new_spot_target = len(spot_instances) - len(spot_to_remove) + len(nodes_to_create)
-                else:
-                    new_demand_target = len(demand_instances) - len(od_to_remove) + len(nodes_to_create)
-                    new_spot_target = len(spot_instances) - len(spot_to_remove)
 
                 # Status messages.
                 logger.info("Partition %s is requesting %s active nodes" % (partition_name, num_nodes))
@@ -329,13 +419,12 @@ for partition_name, nodegroups in partition_fleet_ids.items():
                 logger.info("Partition %s needs to remove %s instances from fleet, and start %s instances" % (partition_name, len(od_to_remove) + len(spot_to_remove), len(nodes_to_create)))
 
                 # Is this fleet already configured?
-                if len(od_to_remove) == 0 and len(spot_to_remove) == 0 and len(nodes_to_create) == 0:
+                if len(od_to_remove) == 0 and len(spot_to_remove) == 0 and len(nodes_to_create) == 0 and len(new_instances) == 0:
                     logger.info("Partition %s already fully provisioned" % partition_name)
                     continue
 
                 # Expand or shrink fleet size, if necessary
-                fleet_command = {"TotalTargetCapacity": num_nodes, "OnDemandTargetCapacity": new_demand_target, "SpotTargetCapacity": new_spot_target}
-                adjust_fleet_size(client, fleet_id, fleet_command)
+                adjust_fleet_size(client, fleet_id, num_nodes, len(od_to_remove), fleet_type)
 
                 # Delete extraneous instances.
                 # On-demand instances.
@@ -369,6 +458,14 @@ for partition_name, nodegroups in partition_fleet_ids.items():
                             logger.error('Failed to terminate orphan instance in fleet %s - %s' %(fleet_id, e))
                 else:
                     logger.debug("No new instances currently allocated to fleet %s. Will check again later." % (fleet_id))
+
+                    # If this is a spot fleet, check to see if we have reached spot capacity, or if it has taken an excessivly long amount
+                    # of time to obtain the necessary spot instances
+                    # If this is the case, we will fall back to requesting on-demand instances.
+                    if fleet_type == "spot":
+                        if len(nodes_to_create) > 0 and spot_allocation_timeout(client, fleet_id, timeout_seconds=300):
+                            logger.info("Attempting to fill oustanding capacity of fleet %s with On-Demand instances" % (fleet_id))
+                            spot_fallback_to_demand(client, fleet_id, num_nodes)
 
         except TimeoutError:
             logger.warning("Failed to process partition %s: Partition is locked" % partition_name)
