@@ -26,7 +26,7 @@ Parameters:
 
   LatestAmiId:
     Type: String
-    Default: ami-0e934cbeb31c90bb7
+    Default: ami-08671f1c4afef4eac
     Description: AMI to be used for head node and cluster node creation
 
   HeadNodeInstanceType:
@@ -139,6 +139,7 @@ Resources:
                   - ec2:DescribeFleets
                   - ec2:DeleteFleets
                   - ec2:DescribeFleetInstances
+                  - ec2:DescribeFleetHistory
                   - ec2:RunInstances
                   - ec2:TerminateInstances
                   - ec2:ModifyFleet
@@ -222,6 +223,9 @@ Resources:
             !Sub |
               #!/bin/bash -x
 
+              sudo apt install -y nfs-common
+              /etc/sysctl.conf
+
               sudo rm /lib/systemd/system/nfs-common.service
               systemctl daemon-reload
               systemctl enable nfs-common
@@ -257,10 +261,10 @@ Resources:
             !Sub |
               #!/bin/bash -x
 
+              sudo apt install -y nfs-kernel-server
+
               # Configure local storage (if availible).
               mountpoint=/shared/
-              mkdir -p $mountpoint
-              chmod 777 $mountpoint
               fdisk -l
               localdisks=($(fdisk -l | grep -o '/dev/nvme[0-9]*n[0-9]*' | grep -v nvme0))
 
@@ -403,10 +407,6 @@ Resources:
                                 {
                                     "InstanceType": "c7i.12xlarge",
                                     "Priority": 2.0
-                                },
-                                {
-                                    "InstanceType": "c6a.12xlarge",
-                                    "Priority": 4.0
                                 },
                                 {
                                     "InstanceType": "c7a.12xlarge",
@@ -590,6 +590,13 @@ Resources:
               mkdir -p /shared/sagasign-resources/references/
               chmod 777 /shared/sagasign-resources/references/
               cp -r /home/sagasign-resources/references/* /shared/sagasign-resources/references/ &
+
+              # Create the required folders under the shared directory.
+              mkdir -m 777 /shared/fastq_raw /shared/bi_metadata /shared/runs /shared/dynamic_blacklist /shared/dynamic_blacklist
+
+              # Sync the dynamic blacklist files.
+              aws s3 sync --no-progress s3://dynamic-blacklist-eu/ /shared/dynamic_blacklist/
+              chmod -R 775 /shared/dynamic_blacklist/
 
               cfn-signal -e $? --stack ${AWS::StackName} --resource HeadNodeInstance --region ${AWS::Region}
     CreationPolicy:
