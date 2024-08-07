@@ -24,6 +24,10 @@ sudo systemctl enable munge
 sudo systemctl start munge
 sleep 5
 
+# Expand process limits
+echo '*     soft    nofile 1048576' | sudo tee --append /etc/security/limits.conf
+
+# Setup mount point
 sudo mkdir --parents /shared
 sudo chmod 777 /shared
 
