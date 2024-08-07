@@ -201,13 +201,13 @@ def spot_fallback_to_demand(client, fleet_id, target_capacity):
     except Exception as e:
         logger.warning("Unable to describe spot instances in fleet %s - %s" % (fleet_id, e))
 
-    num_spot_allocated = len(describe_response["Reservations"])
+    num_spot_allocated = sum(len(x["Instances"]) for x in describe_response["Reservations"])
 
     # How many additional On-Demand instances should we request?
     target_od = target_capacity - num_spot_allocated
 
     # Adjust the size of the requested fleet
-    fleet_command = {"TotalTargetCapacity": target_capacity, "OnDemandTargetCapacity": num_spot_allocated, "SpotTargetCapacity": target_od}
+    fleet_command = {"TotalTargetCapacity": target_capacity, "OnDemandTargetCapacity": target_od, "SpotTargetCapacity": num_spot_allocated}
     logger.debug("Modifying size of fleet %s to %s" % (fleet_id, fleet_command))
     try:
         change_fleet_response = client.modify_fleet(FleetId=fleet_id, TargetCapacitySpecification=fleet_command, ExcessCapacityTerminationPolicy="no-termination")
@@ -459,13 +459,13 @@ for partition_name, nodegroups in partition_fleet_ids.items():
                 else:
                     logger.debug("No new instances currently allocated to fleet %s. Will check again later." % (fleet_id))
 
-                    # If this is a spot fleet, check to see if we have reached spot capacity, or if it has taken an excessivly long amount
-                    # of time to obtain the necessary spot instances
-                    # If this is the case, we will fall back to requesting on-demand instances.
-                    if fleet_type == "spot":
-                        if len(nodes_to_create) > 0 and spot_allocation_timeout(client, fleet_id, timeout_seconds=300):
-                            logger.info("Attempting to fill oustanding capacity of fleet %s with On-Demand instances" % (fleet_id))
-                            spot_fallback_to_demand(client, fleet_id, num_nodes)
+                # If this is a spot fleet, check to see if we have reached spot capacity, or if it has taken an excessivly long amount
+                # of time to obtain the necessary spot instances
+                # If this is the case, we will fall back to requesting on-demand instances.
+                if fleet_type == "spot":
+                    if len(nodes_to_create) > 0 and spot_allocation_timeout(client, fleet_id, timeout_seconds=210):
+                        logger.info("Attempting to fill oustanding capacity of fleet %s with On-Demand instances" % (fleet_id))
+                        spot_fallback_to_demand(client, fleet_id, num_nodes)
 
         except TimeoutError:
             logger.warning("Failed to process partition %s: Partition is locked" % partition_name)
