@@ -212,6 +212,9 @@ Resources:
       LaunchTemplateData:
         KeyName: !Ref KeyPair
         ImageId: !Ref LatestAmiId
+        HibernationOptions:
+          Configured: true
+        EbsOptimized: true
         IamInstanceProfile:
           Arn: !GetAtt [ ComputeNodeInstanceProfile, Arn ]
         MetadataOptions:
@@ -250,6 +253,7 @@ Resources:
       InstanceType: !Ref HeadNodeInstanceType
       IamInstanceProfile: !Ref HeadNodeInstanceProfile
       KeyName:  !Ref KeyPair
+      EbsOptimized: true
       NetworkInterfaces: 
         - NetworkInterfaceId: !Ref HeadNodeNetworkInterface
           DeviceIndex: 0
