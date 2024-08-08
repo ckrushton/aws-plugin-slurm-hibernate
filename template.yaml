@@ -2,16 +2,6 @@ AWSTemplateFormatVersion: "2010-09-09"
 Description: Deploy the slurm infrastructure required to run the SAGAsign bioinformatics workflow
 
 Parameters:
-  SlurmPackageUrl:
-    Type: String
-    Default: https://download.schedmd.com/slurm/slurm-23.02.2.tar.bz2
-    Description: URL to the Slurm installation package. The filename must be like slurm-*.tar.bz2
-
-  PluginPrefixUrl:
-    Type: String
-    Default: https://github.com/ckrushton/aws-plugin-slurm-hibernate/raw/hibernate-support/
-    Description: Path to the plugin files
-
   VpcId:
     Type: AWS::EC2::VPC::Id
     Description: VPC where the headnode and the compute nodes will be launched
@@ -26,7 +16,7 @@ Parameters:
 
   LatestAmiId:
     Type: String
-    Default: ami-08671f1c4afef4eac
+    Default: ami-0bba1c902eb2316e8
     Description: AMI to be used for head node and cluster node creation
 
   HeadNodeInstanceType:
@@ -50,11 +40,6 @@ Metadata:
           - ComputeNodeCPUs
           - KeyPair
           - LatestAmiId
-      - Label: 
-          default: Packages
-        Parameters: 
-          - SlurmPackageUrl
-          - PluginPrefixUrl
     ParameterLabels: 
       VpcId: 
         default: VPC ID
@@ -65,11 +50,7 @@ Metadata:
       KeyPair: 
         default: Key Pair
       LatestAmiId: 
-        default: Latest Amazon Linux 2 AMI ID
-      SlurmPackageUrl: 
-        default: Slurm Package URL
-      PluginPrefixUrl: 
-        default: Plugin URL Prefix
+        default: Latest cluster template AMI (created using ami_configuration_script.sh)
 
 Resources:
   SecurityGroup:
@@ -226,9 +207,7 @@ Resources:
             !Sub |
               #!/bin/bash -x
 
-              sudo apt install -y nfs-common
-              /etc/sysctl.conf
-
+              # Start NFS and mount head node directories
               sudo rm /lib/systemd/system/nfs-common.service
               systemctl daemon-reload
               systemctl enable nfs-common
@@ -238,9 +217,9 @@ Resources:
               sudo chmod 777 /shared/
               mount -t nfs ${HeadNodeNetworkInterface.PrimaryPrivateIpAddress}:/nfs /nfs
               mount -t nfs ${HeadNodeNetworkInterface.PrimaryPrivateIpAddress}:/shared /shared
-              export SLURM_HOME=/nfs/slurm
               sleep 20
 
+              export SLURM_HOME=/nfs/slurm
               mkdir -p /var/spool/slurm
               'cp' $SLURM_HOME/etc/slurm/slurmd.service /lib/systemd/system
               systemctl enable slurmd.service
@@ -264,8 +243,6 @@ Resources:
           Fn::Base64:
             !Sub |
               #!/bin/bash -x
-
-              sudo apt install -y nfs-kernel-server
 
               # Configure local storage (if availible).
               mountpoint=/shared/
@@ -300,30 +277,7 @@ Resources:
               reffiles="/home/sagasign-resources/references/"
               find $reffiles -type f | parallel --jobs 8 dd if={} of=/dev/null bs=10M iflag=direct &
 
-              # Install Slurm
-              cd /home/ubuntu/
-              wget -q ${SlurmPackageUrl}
-              tar -xvf /home/ubuntu/slurm-*.tar.bz2 -C /home/ubuntu
-              cd /home/ubuntu/slurm-*/
-              /home/ubuntu/slurm-*/configure --prefix=/nfs/slurm
-              make -j 12
-              make install -j 12
-              make install-contrib -j 12
-              sleep 5
               export SLURM_HOME=/nfs/slurm
-              mkdir -p $SLURM_HOME/etc/slurm
-              'cp' /home/ubuntu/slurm-*/etc/* $SLURM_HOME/etc/slurm
-
-              # Install plugin
-              mkdir -p $SLURM_HOME/etc/aws
-              cd $SLURM_HOME/etc/aws
-              wget -q ${PluginPrefixUrl}common.py
-              wget -q ${PluginPrefixUrl}resume.py
-              wget -q ${PluginPrefixUrl}suspend.py
-              wget -q ${PluginPrefixUrl}generate_conf.py
-              wget -q ${PluginPrefixUrl}change_state.py
-              wget -q ${PluginPrefixUrl}fleet_daemon.py 
-              chmod +x *.py
 
               cat > $SLURM_HOME/etc/aws/config.json <<EOF
               {
