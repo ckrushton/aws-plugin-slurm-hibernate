@@ -1,25 +1,34 @@
-# AWS Plugin for Slurm - Version 2
+# AWS Slurm plugin supporting Spot Instance hibernation
 
-> **Note from September 11, 2020**: We've redeveloped the Slurm plugin for AWS. The new version is available in the [plugin-v2](https://github.com/aws-samples/aws-plugin-for-slurm/tree/plugin-v2) branch. Major changes includes: support of EC2 Fleet capabilities such as Spot or instance type diversification, decoupling node names from instance host names or IP addresses, better error handling when a node fails to respond during its launch. You can use the following command to clone this branch locally.
+> *DISCLAIMER: This repository and plugin are provided AS-IS, and you should DEFINITELY perform small scale tests with your use case and software before implementing it!* I have tried to ensure the fleets are managed as robustly as possible with some fail-safes, but there are most likely still lingering bugs!
 
-> `git clone -b plugin-v2 https://github.com/aws-samples/aws-plugin-for-slurm.git`
+This plugin is based on [Amazon's AWS plugin for slurm](https://github.com/aws-samples/aws-plugin-for-slurm), but has been significantly overhauled to utilize persistant EC2 fleets, allowing Spot fleets to be created which support instance hibernation.
 
-A sample integration of AWS services with Slurm
+## When should I use this?
 
-[Slurm](https://slurm.schedmd.com/) is a popular HPC cluster management system. This plugin enables the Slurm headnode to dynamically deploy and destroy compute resources in the cloud, regardless of where the headnode is executed. Traditional HPC clusters usually distribute jobs over a static set of resources. With this plugin, you can take advantage of the elasticity and pay-per-use model of the cloud to run jobs.
+If you are running a workflow which contains a long-running job (for instance, human genome sequencing alignment) which cannot be easily paused or interrupted, it is normally extremely risky to use spot instances, as such a job will have to be restarted if the spot instance is interrupted. AWS recently expanded its support for [instance hibernation](https://aws.amazon.com/about-aws/whats-new/2023/10/amazon-ec2-hibernate-supports-more-operating-systems/), enabling interrupted spot instances to be hibernated (with all memory contents stored on disk) and resumed once a new spot instance becomes avaliable. You can read more about EC2 Instance hibernation [here](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instance-hibernate-overview.html).
 
-Typical use cases include:
+You can read more about the requirements for Instance hibernation [here](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/hibernating-prerequisites.html)
 
-* Bursting into the cloud to dynamically allocate resources in addition to your on-premises resources. This enables to run jobs faster, or to take advantage of the wide selection of AWS instance types to run jobs that have specific requirements, such as GPU-based workloads.
+## How it works
+This plugin (just like the original plugin) relies on the existing Slurm power save logic (see [Power Saving Guide](https://slurm.schedmd.com/power_save.html) and [Cloud Scheduling Guide](https://slurm.schedmd.com/elastic_computing.html) in the Slurm documentation).
 
-* Deploying a self-contained HPC cluster in the cloud, as an alternative approach to managed HPC clusters, such as [AWS ParallelCluster](https://aws.amazon.com/hpc/parallelcluster/).
+When the head node is first started and Slurm is configured, this plugin creates an EC2 fleet (with size 0) for each parition specified in the Slurm configuration. All nodes that Slurm may launch in AWS must be initially declared in the Slurm configuration, but their IP address and host name don't have to be specified in advance. These nodes are placed initially in a power saving mode. When work is assigned to them by the Slurm scheduler, the headnode executes the program `ResumeProgram` and passes the list of nodes to resume as argument, which marks a list of nodes to be created. After a idle period, when nodes are no longer required, the headnode executes the program `SuspendProgram` with the list of nodes to suspend as argument, marking nodes for destruction.
+
+The plugin daemon (`fleet_daemon.py`) is installed and configured on the head node, and runs every minute to check the status of each partion. This daemon will resize each EC2 fleet based on the number of active nodes in the corresponding partition, and AWS will automatically attempt to assign new instances to a fleet if the fleet size is increased. The daemon subsequently checks each fleet for new instances and registers them with Slurm. Note that these steps are done asyncronously; i.e. the daemon will expand a fleet when it is run, but will check for new instances in subsequent runs of the daemon instead of waiting. Any nodes suspended by Slurm are terminated, as well (as a failsafe) any instances outside the requested capacity (to avoid orphan instances if the fleet size is quickly scaled up and down).
+
+When handling Spot Fleets, the daemon checks and updates the IP address associated with a node if the underlying instance changes (for instance, a spot instance has been replaced). It will also automatically fill the fleet with On-Demand instances if Spot capacity has been exhasted.
+
+## Plugin files
+
+This plugin is comprised of a set of python scripts for interfacing with slurm
 
 ## Table of Contents
 
 * [Concepts](#tc_concepts)
 * [Plugin files](#tc_files)
-* [Manual deployment](#tc_manual)
 * [Deployment with AWS CloudFormation](#tc_cloudformation)
+* [Troubleshooting and Logging](#logging)
 * [Appendix: Examples of `partitions.json`](#tc_partitions)
 
 <a name="tc_concepts"/>
@@ -36,15 +45,154 @@ This plugin consists of the programs that Slurm executes when nodes are restored
 
 ## Plugin files
 
-The plugin is composed of 5 Python files and 2 JSON configuration files. They all must reside in the same folder. This section details the purpose and format of each file.
+The plugin is composed of 6 Python files, a shell script, and a CloudFormation configuration YAML file. This section details the purpose and format of each file.
 
-### `config.json`
+### `ami_configuration_script.sh`
+
+This script installs all the dependencies required for Slurm, AWS-specific dependencies (awscli, boto3), and essential plugin files (resume.py, common.py, fleet_daemon.py). Installs Slurm, but does not configure or start the Slurm daemon.
+
+### `generate_conf.py`
+
+This script is used to create the EC2 fleets associated with each partition, and generates associated Slurm configuration files. The resulting `slurm.conf.aws` must be appended to `slurm.conf`.
+
+- This script parses `partitions.json` and automatically determines the vCPU and memory specifications of the instances requested for each fleet. The fleet specifications are set as the minimum value for vCPU and memory across all instance types requested for that fleet.
+    - For instance, if `c6i.12xlarge` instances (48 vCPUs, 96GB memory) and `r6i.8xlarge` instances (32 vCPUs, 256GB memory) are requested in the same partition, it will be configured as having 32 CPUs and 96GB of memory
+- The EC2 fleet ID associated with each partition is formatted as a comment line in `slurm.conf.aws`
+    - #EC2_FLEET {partition} {nodegroup} {EC2 fleet ID}
+
+### `common.py`
+
+This script contains variables and functions that are used by more than one Python scripts.
+
+### `resume.py`
+
+This script is the `ResumeProgram` program executed by Slurm to restore nodes in normal operation:
+
+- It retrieves the list of nodes to resume, and for each partition and node group, it appends the partition-associated text file located under `/nfs/slurm/etc/aws/partitions/`
+    - These files list all active nodes associated with each partition.
+
+You can manually try the resume program by running `/fullpath/resume.py (partition_name)-(nodegroup_name)-(id)` such as  `/fullpath/resume.py partition-nodegroup-0`.
+
+### `suspend.py`
+
+This script is the `SuspendProgram` executed by Slurm to place nodes in power saving mode:
+
+- It retrieves the list of nodes to suspend, and for each partition and node group, it removes that node from partition-associated text file located under `/nfs/slurm/etc/aws/partitions/`
+
+You can manually try the suspend program by running `/fullpath/suspend.py (partition_name)-(nodegroup_name)-(id)` such as  `/fullpath/suspend.py partition-nodegroup-0`.
+
+### `change_state.py`
+
+This script is executed every minute by `cron` to change the state of nodes that are stuck in a transient or undesired state. For example, compute nodes that failed to respond within `ResumeTimeout` seconds are placed in a `DOWN*` state and the state must be set to `POWER_DOWN`.
+
+### `fleet_daemon.py`
+
+The essential linchpin of the plugin; used to manage and scale EC2 fleets, assign and register instances with slurm, and handle spot and EC2. This is run as a CRON job every minute on the head node.
+
+- For each partition and nodegroup registered with Slurm:
+    - Parses the EC2 fleet ID from `slurm.conf`
+    - Parses the active node partition file under `/nfs/slurm/etc/aws/partitions/` to obtain a list of instances requested by Slurm
+    - Obtains a list of all instances assigned to this EC2 fleet, and their associated Slurm nodename
+    - If the number of nodes has been updated, the size of the EC2 fleet is updated accordingly.
+    - Any instances associated with suspended nodes are terminated.
+    - Any additional fleet instances are assigned and registered with Slurm.
+       - The IP address of the new instances are added to `/etc/hosts`
+    - Any extraneous instances associated with a fleet are terminated.
+       - This can occur of a fleet is scaled up, then scaled back down quickly before the new instances are assigned and registered with Slurm.
+       - Prevents zombie instances from being generated.
+
+- Additionally, Spot fleets where a `spotInstanceCountLimitExceeded` or `spotFleetRequestConfigurationInvalid` error is found in the fleet history, or where no new nodes have been spun up in 4 minutes, fall back and fill outstanding capacity with On-Demand instances.
+
+### `template.yaml`
+
+The CloudFormation template used to initialize the cluster head node, configure Slurm, and manage fleet nodes. This is explained in more detail below.
+
+<a name="tc_cloudformation"/>
+
+## CloudFormation template
+
+This template is used to create and configure the head node (and cluster nodes), perform final slurm configuration, and setup instances within the assigned VPC and subset. This template requires the following user parameters:
+
+1. An existing VPC and subset for the cluster to reside in.
+2. An SSH keypair for connecting to the instance(s).
+3. The AMI to be used when creating cluster instances or the head node instance.
+
+### AWS AMI creation.
+
+The AWS AMI used by head node and compute nodes comes pre-installed with Slurm and associated dependencies, this plugin, NFS, and other key dependencies. This also [disables KASLR](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/hibernation-disable-kaslr.html). This AMI can be created from scratch using the following:
+
+1. Start an EC2 instance with the following specifications.
+
+- AMI: Ubuntu 22.04 LTS
+- Instance type: t3.2xlarge (or similar)
+- Key pair: SSH key of your choice
+- Storage: 
+    - Size: 1000 GiB
+    - Volume type: gp3
+    - Encrypted: Encrypted
+    - KMS key: aws/ebs
+- Advanced details:
+    - Stop - Hibernate behavior: Enable
+    - Metadata version: V2 only
+
+2. Log onto the EC2 instance
+
+Use the SSH key you selected above, an obtain the server IP address from EC2
+
+```
+ssh -i {your SSH key here} ubuntu@{Intance IP address here}
+```
+
+3. Run the AMI configuration script.
+
+```
+wget https://raw.githubusercontent.com/ckrushton/aws-plugin-slurm-hibernate/hibernate-support/ami_configuration_script.sh
+bash ami_configuration_script.sh
+```
+
+4. Install any additional software or make any additional changes as desired.
+
+### How it works
+
+The head node recipe performs the following:
+
+1. If the instance contains directly attatched storage, a filesystem is created and it is mounted under /shared/
+- Note that multiple drives are stripped together into a single filesystem as RAID0
+
+2. `/nfs/` and `/shared/` are shared via NFS
+- If no instance storage is avalible, `/shared/` will correspond to the EBS storage attatched to the head node.
+
+3. The Slurm configuration files are created.
+- See below for a more detailed description.
+
+4. This plugin and the associated daemon are started and configured
+
+5. The Slurm Control Daemon is started.
+
+The cluster node recipe performs the following:
+
+1. Mounts `/nfs/` and `/shared/` from the head node
+
+2. Starts the Slurm Daemon.
+
+### Cleanup
+
+A lambda function automatically deletes all fleets (and terminates instances) associated with this Stack upon stack deletion.
+
+<a name="tc_manual"/>
+
+### Configuration files
+
+Note these files are embeded directly in the CloudFormation template to maximize portability and ease-of-use when making modifications to Slurm or the plugin.
+
+#### `config.json`
 
 This JSON file specifies the plugin and Slurm configuration parameters.
 
 ```
 {
    "LogLevel": "STRING",
+   "NodePartitionFolder": "STRING",
    "LogFileName": "STRING",
    "SlurmBinPath": "STRING",
    "SlurmConf": {
@@ -62,6 +210,7 @@ This JSON file specifies the plugin and Slurm configuration parameters.
 ```
 
 * `LogLevel`: Logging level. Possible values are `CRITICAL`, `ERROR`, `WARNING`, `INFO`, `DEBUG`. Default is `DEBUG`.
+* `NodePartitionFolder`: Folder where the text files containing active nodes for each partition and nodegroup are stored. Example: `/nfs/slurm/etc/aws/partitions/`
 * `LogFileName`: Full path to the log file location. Default is `PLUGIN_PATH\aws_plugin.log`.
 * `SlurmBinPath`: Full path to the folder that contains Slurm binaries like `scontrol` or `sinfo`. Example: `/slurm/bin`.
 * `SlurmConf`: These attributes are used by `generate_conf.py` to generate the content that must be appended to the Slurm configuration file. You must specify at least the following attributes:
@@ -79,6 +228,7 @@ Example:
 ```
 {
    "LogLevel": "INFO",
+   "NodePartitionFolder": "/nfs/slurm/etc/aws/partitions/",
    "LogFileName": "/var/log/slurm/aws.log",
    "SlurmBinPath": "/slurm/bin",
    "SlurmConf": {
@@ -94,7 +244,7 @@ Example:
 }
 ```
 
-### `partitions.json`
+#### `partitions.json`
 
 This JSON file specifies the groups of nodes and associated partitions that Slurm can launch in AWS.
 
@@ -109,11 +259,6 @@ This JSON file specifies the groups of nodes and associated partitions that Slur
                "MaxNodes": INT,
                "Region": "STRING",
                "ProfileName": "STRING",
-               "SlurmSpecifications": {
-                  "NodeSpec1": "STRING",
-                  "NodeSpec2": "STRING",
-                  ...
-               },
                "PurchasingOption": "spot|on-demand",
                "OnDemandOptions": DICT,
                "SpotOptions": DICT,
@@ -146,7 +291,6 @@ This JSON file specifies the groups of nodes and associated partitions that Slur
       * `MaxNodes`: Maximum number of nodes that Slurm can launch for this node group. For each node group, `generate_conf.py` will issue a line with `NodeName=[partition_name]-[nodegroup_name]-[0-(max_nodes-1)]`
       * `Region`: Name of the AWS region where to launch EC2 instances for this node group. Example: `us-east-1`.
       * [OPTIONAL] `ProfileName`: Name of the AWS CLI profile to use to authenticate AWS requests. If you don't specify a profile name, it uses the default profile name of EC2 metadata credentials.
-      * `SlurmSpecifications`: List of Slurm configuration attributes for this node group. For example if you provide `{"CPUs": 4, "Features": "us-east-1a"}` the script `generate_conf.py`will output `CPUs=4 Features=us-east-1a` in the configuration line related to this node group.
       * `PurchasingOption`: Possible values are `spot` or `on-demand`.
       * `OnDemandOptions`: Must be included if `PurchasingOption` is equal to `on-demand` and filled in the same way than the object of the same name in the [EC2 CreateFleet API](https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/ec2.html#EC2.Client.create_fleet).
       * `SpotOptions`: Must be included if `PurchasingOption` is equal to `spot` and filled in the same way than the object of the same name in the [EC2 CreateFleet API](https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/ec2.html#EC2.Client.create_fleet).
@@ -160,170 +304,16 @@ This JSON file specifies the groups of nodes and associated partitions that Slur
 
 Refer to the section **Examples of `partitions.json`** for examples of file content.
 
-### `common.py`
+<a name="logging"/>
 
-This script contains variables and functions that are used by more than one Python scripts.
+## Logging and troubleshooting
 
-### `resume.py`
+The following logs may be useful when troubleshooting issues with the head node, cluster nodes, Slurm, or the plugin.
 
-This script is the `ResumeProgram` program executed by Slurm to restore nodes in normal operation:
-
-* It retrieves the list of nodes to resume, and for each partition and node group:
-   * It creates an instant EC2 fleet to launch the requested number of EC2 instances. This call is synchronous and the response contains the list of EC2 instances that were launched. For each instance:
-      * It creates a tag `Name` whose value is the name of the node `[partition_name]-[nodegroup_name]-[id]` and other tags if specified for this node group.
-      * It updates the node IP address and host name in Slurm with `scontrol`.
-
-You can manually try the resume program by running `/fullpath/resume.py (partition_name)-(nodegroup_name)-(id)` such as  `/fullpath/resume.py partition-nodegroup-0`.
-
-### `suspend.py`
-
-This script is the `SuspendProgram` executed by Slurm to place nodes in power saving mode:
-
-* It retrieves the list of nodes to suspend, and for each node:
-   * It finds the instance ID for this node
-   * It terminates the instance
-
-You can manually try the suspend program by running `/fullpath/suspend.py (partition_name)-(nodegroup_name)-(id)` such as  `/fullpath/suspend.py partition-nodegroup-0`.
-
-### `change_state.py`
-
-This script is executed every minute by `cron` to change the state of nodes that are stuck in a transient or undesired state. For example, compute nodes that failed to respond within `ResumeTimeout` seconds are placed in a `DOWN*` state and the state must be set to `POWER_DOWN`.
-
-### `generate_conf.py`
-
-This script is used to generate the Slurm configuration that is specific to this plugin. You must append the content of the output file to `slurm.conf`.
-
-<a name="tc_manual"/>
-
-## Manual deployment
-
-### Prerequisites
-
-* You must have a Slurm headnode that is already functional, no matter where it resides. The plugin was tested with Slurm 20.02.3, but it should be compatible with any Slurm version that supports power saving mode.
-
-* You will need to provide one or more subnets in which the EC2 compute nodes will be launched. If the headnode is not running on AWS, you must establish private connectivity between the headnode and these subnets, such as a VPN connection.
-
-* **Important**: The compute nodes must specify their cluster name when launching `slurmd`. The cluster name can be retrieved from the EC2 instance tag. If you use `systemctl` to launch Slurm, here is what you could do to automatically pass the node name when compute nodes start `slurmd`:
-
-Create a script that returns the node name from the EC2 tag, or the hostname if the tag value cannot be retrieved. You must have the AWS CLI installed to run this script, and you must allow access to tags in instance metadata by setting `InstanceMetadataTags` to `enabled`. Adapt the full path of the script `/fullpath/get_nodename` to your own context:
-
-```
-cat > /fullpath/get_nodename <<'EOF'
-instanceid=`/usr/bin/curl --fail -m 2 -s 169.254.169.254/latest/meta-data/instance-id`
-if [[ ! -z "$instanceid" ]]; then
-   hostname=`/usr/bin/curl -s http://169.254.169.254/latest/meta-data/tags/instance/Name`
-fi
-if [ ! -z "$hostname" -a "$hostname" != "None" ]; then
-   echo $hostname
-else
-   echo `hostname`
-fi
-EOF
-chmod +x /fullpath/get_nodename
-```
-
-Add or change the following attributes in the service configuration file `/lib/systemd/system/slurmd.service`:
-
-```
-ExecStartPre=/bin/bash -c "/bin/systemctl set-environment SLURM_NODENAME=$(/fullpath/get_nodename)"
-ExecStart=/nfs/slurm/sbin/slurmd -N $SLURM_NODENAME $SLURMD_OPTIONS
-```
-
-### Instructions
-
-1) Install Python 3 and boto3 on the headnode. You may also need the AWS CLI to configure AWS credentials:
-```
-sudo yum install python3 python3-pip -y
-sudo pip3 install boto3
-sudo pip3 install awscli
-```
-
-2) Copy the PY files to a folder, such as `$SLURM_ROOT/etc/aws` and make them files executable. Adapt the full path to your own context.
-
-```
-cd /fullpath
-wget -q https://github.com/aws-samples/aws-plugin-for-slurm/raw/plugin-v2/common.py
-wget -q https://github.com/aws-samples/aws-plugin-for-slurm/raw/plugin-v2/resume.py
-wget -q https://github.com/aws-samples/aws-plugin-for-slurm/raw/plugin-v2/suspend.py
-wget -q https://github.com/aws-samples/aws-plugin-for-slurm/raw/plugin-v2/generate_conf.py
-wget -q https://github.com/aws-samples/aws-plugin-for-slurm/raw/plugin-v2/change_state.py 
-chmod +x *.py
-```
-
-3) You need to grant the headnode AWS permissions to make EC2 requests.
-
-If the headnode resides on AWS, create an IAM role for EC2 (see [Creating an IAM role](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/iam-roles-for-amazon-ec2.html#create-iam-role)) with an inline policy that allows the actions below, and attach the role to the headnode (see [Attaching an IAM role to an instance](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/iam-roles-for-amazon-ec2.html#attach-iam-role)).
-
-If the headnode is not on AWS, create an IAM user (see [Creating IAM users](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_users_create.html#id_users_create_console)) with an inline policy that allows the actions below. Create an access key for that user (see [Managing access keys](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_access-keys.html#Using_CreateAccessKey)). Then, configure AWS credentials on your headnode using the AWS CLI (see [Configuring the AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/cli-chap-configure.html)). You can either configure the default AWS CLI profile with `aws configure`, or create a custom profile with `aws configure --profile profile_name` that you will reference in `ProfileName`.
-
-The minimum required permissions are:
-
-```
-ec2:CreateFleet
-ec2:RunInstances
-ec2:TerminateInstances
-ec2:CreateTags
-ec2:DescribeInstances
-iam:CreateServiceLinkedRole (required if you never used EC2 Fleet in your account)
-iam:PassRole (you can restrict this actions to the ARN of the EC2 role for compute nodes)
-```
-
-4) Create an IAM role for EC2 compute nodes that allows the action `ec2:DescribeTags` (see [Creating an IAM role](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/iam-roles-for-amazon-ec2.html#create-iam-role)).
-
-5) Create one or more EC2 launch templates that will be used to create EC2 compute nodes.
-
-A launch template specifies some of the required instance configuration parameters. For each launch template, you must specify at least the AMI ID, the security group(s) to attach, the EC2 role, and eventually a key pair and some scripts to execute at launch with `UserData`. You will multiple launch templates if your EC2 compute nodes need various values for these parameters.
-
-For example launch template to create, follow the instructions at [Creating a new launch template using parameters you define](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-launch-templates.html#create-launch-template-define-parameters). Note the launch template name or launch template ID for later use.
-
-6) Create the JSON configuration files `config.json` and `partitions.json` in the same folder than the PY files, and populate them as instructed in the **Plugin files** section.
-
-7) Run `generate_conf.py` and append the content of the output file `slurm.conf.aws` to your Slurm configuration file `slurm.conf`. Refresh the Slurm configuration by running the command `scontrol reconfigure`, or by restarting Slurmctld.
-
-Here is an example of output file:
-
-```
-PrivateData=CLOUD
-ResumeProgram=/slurm/etc/aws/resume.py
-SuspendRate=100
-# ...More Slurm parameters
-
-NodeName=aws-node-[0-99] State=CLOUD CPUs=4
-Partition=aws Nodes=aws-node-[0-99] Default=No MaxTime=INFINITE State=UP
-```
-
-8) Change the `cron` configuration to run the script `change_state.py` every minute.
-
-```
-sudo crontab -e
-```
-
-If the Slurm user is not root, you could create the cron for that user instead `sudo crontab -e -u username`. Add the following line into the file. Make sure to adapt the path `/fullpath/change_state.py` to your own context.
-
-```
-* * * * * /fullpath/change_state.py &>/dev/null
-```
-
-<a name="tc_cloudformation"/>
-
-## Deployment with AWS CloudFormation
-
-You can use AWS CloudFormation to provision a sample pre-configured headnode on AWS. To proceed, create a new CloudFormation stack using the template that is provided in [`template.yaml`](template.yaml). You will need to specify an existing VPC and two subnets that are in two different availability zones where the head node and the compute nodes will be launched.
-
-The stack will create the following resource:
-
-* A security group that allows SSH traffic from the Internet and traffic between Slurm nodes
-* Two IAM roles to grant necessary permissions to the head node and the compute nodes
-* A launch template that will be used to launch compute nodes
-* The head node. The stack returns the instance ID of the head node.
-
-The plugin is configured with a single partition `aws` and a single node group `node` that contains up to 100 instances launched in on-demand mode.
-
-To test the solution:
-
-1) Connect onto the head node using SSH
-2) You can run a `sbatch` or `srun` command to the `aws` partition, like `srun -p aws hostname`. You should see a new instance being launched in the Amazon EC2 console.
-3) Once the job is completed, the node will remains idle during `SuspendTime` seconds and will be terminated.
+ - `/var/log/cloud-init-output.log`: Contains all logs related to starting up the node.
+ - `/var/log/slurm_plugin.log`: Contains logs related to `resume.py`, `suspend.py` and `fleet_daemon.py`.
+ - `/var/log/slurmctld.log`: Contains logs from the Slurm control daemon.
+ - `/var/log/slurmd.log`: Contains logs from the Slurm daemon. Only availible on cluster nodes.
 
 <a name="tc_partitions"/>
 
@@ -346,10 +336,6 @@ Single `aws` partition with 2 node groups:
                "NodeGroupName": "ondemand",
                "MaxNodes": 10,
                "Region": "us-east-1",
-               "SlurmSpecifications": {
-                  "CPUs": "4",
-                  "Weight": "1"
-               },
                "PurchasingOption": "on-demand",
                "OnDemandOptions": {
                    "AllocationStrategy": "lowest-price"
@@ -364,8 +350,7 @@ Single `aws` partition with 2 node groups:
                   }
                ],
                "SubnetIds": [
-                  "subnet-11111111",
-                  "subnet-22222222"
+                  "subnet-11111111"
                ],
                "Tags": [
                   {
@@ -378,10 +363,6 @@ Single `aws` partition with 2 node groups:
                "NodeGroupName": "spot",
                "MaxNodes": 100,
                "Region": "us-east-1",
-               "SlurmSpecifications": {
-                  "CPUs": "4",
-                  "Weight": "2"
-               },
                "PurchasingOption": "spot",
                "OnDemandOptions": {
                    "AllocationStrategy": "lowest-price"
@@ -396,8 +377,7 @@ Single `aws` partition with 2 node groups:
                   }
                ],
                "SubnetIds": [
-                  "subnet-11111111",
-                  "subnet-22222222"
+                  "subnet-11111111"
                ],
                "Tags": [
                   {
@@ -433,10 +413,6 @@ Single `aws` partition with 3 node groups:
                "NodeGroupName": "spot4vCPU",
                "MaxNodes": 100,
                "Region": "us-east-1",
-               "SlurmSpecifications": {
-                  "CPUs": "4",
-                  "Weight": "1"
-               },
                "PurchasingOption": "spot",
                "OnDemandOptions": {
                    "AllocationStrategy": "lowest-price"
@@ -454,19 +430,13 @@ Single `aws` partition with 3 node groups:
                   }
                ],
                "SubnetIds": [
-                  "subnet-11111111",
-                  "subnet-22222222"
+                  "subnet-11111111"
                ]
             },
             {
                "NodeGroupName": "spot4vCPUa",
                "MaxNodes": 100,
                "Region": "us-east-1",
-               "SlurmSpecifications": {
-                  "CPUs": "4",
-                  "Features": "us-east-1a",
-                  "Weight": "2"
-               },
                "PurchasingOption": "spot",
                "OnDemandOptions": {
                    "AllocationStrategy": "lowest-price"
@@ -491,11 +461,6 @@ Single `aws` partition with 3 node groups:
                "NodeGroupName": "spot4vCPUb",
                "MaxNodes": 100,
                "Region": "us-east-1",
-               "SlurmSpecifications": {
-                  "CPUs": "4",
-                  "Features": "us-east-1b",
-                  "Weight": "2"
-               },
                "PurchasingOption": "spot",
                "OnDemandOptions": {
                    "AllocationStrategy": "lowest-price"
@@ -536,10 +501,6 @@ Two partitions `aws` and `awsspot` with one node group in each. It uses Slurm ac
                "NodeGroupName": "node",
                "MaxNodes": 100,
                "Region": "us-east-1",
-               "SlurmSpecifications": {
-                  "CPUs": "4",
-                  "Weight": "1"
-               },
                "PurchasingOption": "on-demand",
                "OnDemandOptions": {
                    "AllocationStrategy": "lowest-price"
@@ -557,8 +518,7 @@ Two partitions `aws` and `awsspot` with one node group in each. It uses Slurm ac
                   }
                ],
                "SubnetIds": [
-                  "subnet-11111111",
-                  "subnet-22222222"
+                  "subnet-11111111"
                ]
             }
          ],
@@ -574,10 +534,6 @@ Two partitions `aws` and `awsspot` with one node group in each. It uses Slurm ac
                "NodeGroupName": "node",
                "MaxNodes": 100,
                "Region": "us-east-1",
-               "SlurmSpecifications": {
-                  "CPUs": "4",
-                  "Weight": "1"
-               },
                "PurchasingOption": "spot",
                "SpotOptions": {
                    "AllocationStrategy": "lowest-price"
@@ -595,8 +551,7 @@ Two partitions `aws` and `awsspot` with one node group in each. It uses Slurm ac
                   }
                ],
                "SubnetIds": [
-                  "subnet-11111111",
-                  "subnet-22222222"
+                  "subnet-11111111"
                ]
             }
          ],
