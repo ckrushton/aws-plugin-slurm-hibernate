@@ -217,7 +217,8 @@ Resources:
               sudo chmod 777 /shared/
               mount -t nfs ${HeadNodeNetworkInterface.PrimaryPrivateIpAddress}:/nfs /nfs
               mount -t nfs ${HeadNodeNetworkInterface.PrimaryPrivateIpAddress}:/shared /shared
-              sleep 20
+              # Give the DNS a few seconds to register this node before starting Slurmd
+              sleep 40
 
               export SLURM_HOME=/nfs/slurm
               mkdir -p /var/spool/slurm
