@@ -193,8 +193,6 @@ Resources:
       LaunchTemplateData:
         KeyName: !Ref KeyPair
         ImageId: !Ref LatestAmiId
-        HibernationOptions:
-          Configured: true
         EbsOptimized: true
         IamInstanceProfile:
           Arn: !GetAtt [ ComputeNodeInstanceProfile, Arn ]
@@ -434,7 +432,7 @@ Resources:
               ReturnToService=2
               # TIMERS
               SlurmctldTimeout=300
-              SlurmdTimeout=60
+              SlurmdTimeout=300
               InactiveLimit=0
               MinJobAge=300
               KillWait=30
