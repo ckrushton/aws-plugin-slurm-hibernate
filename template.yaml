@@ -271,11 +271,6 @@ Resources:
               systemctl start nfs-server
               exportfs -av
 
-              # As restoring from an EBS snapshot doesn't actually "restore" the files (until they are read)
-              # force read essential files quickly to ensure they are cached.
-              reffiles="/home/sagasign-resources/references/"
-              find $reffiles -type f | parallel --jobs 8 dd if={} of=/dev/null bs=10M iflag=direct &
-
               export SLURM_HOME=/nfs/slurm
 
               cat > $SLURM_HOME/etc/aws/config.json <<EOF
@@ -440,6 +435,7 @@ Resources:
               # SCHEDULING
               SchedulerType=sched/backfill
               SelectType=select/cons_res
+              TaskPlugin=task/cgroup
               SelectTypeParameters=CR_Core_Memory
               DefMemPerCpu=100
               # LOGGING
@@ -547,13 +543,6 @@ Resources:
               mkdir -p /shared/sagasign-resources/references/
               chmod 777 /shared/sagasign-resources/references/
               cp -r /home/sagasign-resources/references/* /shared/sagasign-resources/references/ &
-
-              # Create the required folders under the shared directory.
-              mkdir -m 777 /shared/fastq_raw /shared/bi_metadata /shared/runs /shared/dynamic_blacklist /shared/dynamic_blacklist
-
-              # Sync the dynamic blacklist files.
-              aws s3 sync --no-progress s3://dynamic-blacklist-eu/ /shared/dynamic_blacklist/
-              chmod -R 775 /shared/dynamic_blacklist/
 
               cfn-signal -e $? --stack ${AWS::StackName} --resource HeadNodeInstance --region ${AWS::Region}
     CreationPolicy:
