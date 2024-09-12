@@ -19,29 +19,17 @@ def get_fleet_instances(fleet_id):
 
     # Get a list of instances allocated with this fleet.
     try:
-        instance_response = client.describe_fleet_instances(FleetId=fleet_id)
-        instances = list(x["InstanceId"] for x in instance_response["ActiveInstances"])
-        logger.debug("DescribeFleetInstances Response:" + json.dumps(instance_response,indent=4))
+        # We include stopping and stopped instances, as those could be in the process of hibernation.
+        fleet_filters = [{"Name": "tag:aws:ec2:fleet-id", "Values": [fleet_id]}, {"Name": "instance-state-name", "Values": ["pending", "running", "stopping", "stopped"]}]
+        instance_response = client.describe_instances(Filters=fleet_filters)
+        logger.debug("DescribeFleetInstances Response:" + json.dumps(instance_response,indent=4,default=str))
+        instances = []
+        if len(instance_response["Reservations"]) > 0:  # There are instances allocated to this fleet.
+            for reservation in instance_response["Reservations"]:
+                instances.extend(x["InstanceId"] for x in reservation["Instances"])
     except Exception as e:
         logger.error('Failed to describe fleet instances for %s: %s' % (fleet_id, e))
         instances = []
-
-    if len(instances) > 0:
-        # Filter for instances which are running
-        try:
-            response_describe = client.describe_instances(InstanceIds=instances,
-                Filters=[{'Name': 'instance-state-name', 'Values': ['pending', 'running']}]
-                )
-            instances = []
-            if len(response_describe["Reservations"]) > 0:
-                for reservation in response_describe["Reservations"]:
-                    for instance_info in reservation["Instances"]:
-
-                        instance_id = instance_info["InstanceId"]
-                        instances.append(instance_id)
-        except Exception as e:
-            logger.critical('Failed to describe instances in fleet %s - %s' % (fleet_id, e))
-            instances = []
 
     return instances
 
@@ -76,7 +64,7 @@ def allocate_new_instances(fleet_id, new_instances, nodes_to_create):
         try:
             response_describe = client.describe_instances(InstanceIds=new_instances,
                 Filters=[
-                    {'Name': 'instance-state-name', 'Values': ['pending', 'running']}
+                    {'Name': 'instance-state-name', 'Values': ['pending', 'running', 'stopping', 'stopped']}
                 ]
             )
         except Exception as e:
@@ -195,7 +183,7 @@ def spot_fallback_to_demand(client, fleet_id, target_capacity):
     # How many spot instances are allocated?
     try:
         describe_response = client.describe_instances(InstanceIds=fleet_instances, Filters=[
-                    {'Name': 'instance-state-name', 'Values': ['pending', 'running']},
+                    {'Name': 'instance-state-name', 'Values': ['pending', 'running', 'stopping', 'stopped']},
                     {"Name": "instance-lifecycle", "Values": ["spot"]}
                 ])
     except Exception as e:
@@ -300,7 +288,7 @@ def link_nodes_to_fleet(client, fleet_instances, nodes):
         try:
             response_describe = client.describe_instances(InstanceIds=list(fleet_instances),
                 Filters=[
-                    {'Name': 'instance-state-name', 'Values': ['pending', 'running']}
+                    {'Name': 'instance-state-name', 'Values': ['pending', 'running', 'stopping', 'stopped']}
                 ]
             )
         except Exception as e:
