@@ -539,10 +539,18 @@ Resources:
               # Add slurm to bashrc file
               echo export PATH=$SLURM_HOME/bin:'$PATH' >> /home/ubuntu/.bashrc
 
-              # Sync to shared filesystem
-              mkdir -p /shared/sagasign-resources/references/
-              chmod 777 /shared/sagasign-resources/references/
-              cp -r /home/sagasign-resources/references/* /shared/sagasign-resources/references/ &
+              # Don't run host verification for instances within the subnet of this VPC.
+              # Adapted from StackOverflow.
+              metadata="http://169.254.169.254/latest/meta-data"
+              mac=$(curl -s $metadata/network/interfaces/macs/ | head -n1 | tr -d '/')
+              cidr_block=$(curl -s $metadata/network/interfaces/macs/$mac/subnet-ipv4-cidr-block)
+              whitelist_ips=$(echo $cidr_block | sed 's/[.]0[.]/.*./g' | sed 's/[.]0[/].*/.*/')
+
+              cat > /home/ubuntu/.ssh/config <<EOF
+              Host $whitelist_ips
+                StrictHostKeyChecking no
+                UserKnownHostsFile=/dev/null
+              EOF
 
               cfn-signal -e $? --stack ${AWS::StackName} --resource HeadNodeInstance --region ${AWS::Region}
     CreationPolicy:
