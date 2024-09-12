@@ -138,7 +138,6 @@ def get_common(scriptname):
 
     # Create a logger
     logger = get_logger(scriptname, config['LogLevel'], config['LogFileName'])
-    logger.debug('Config: %s' %json.dumps(config, indent=4))
 
     # Validate the structure of config.json
     if 'JsonLoadError' in config:
@@ -167,7 +166,6 @@ def get_common(scriptname):
         sys.exit(1)
     finally:
         partitions = partitions_json['Partitions']
-        logger.debug('Partitions: %s' %json.dumps(partitions_json, indent=4))
 
     return logger, config, partitions
 
