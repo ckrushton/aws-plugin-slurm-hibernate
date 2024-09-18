@@ -11,7 +11,7 @@ import time
 
 import common
 
-logger, config, partitions = common.get_common('resume')
+logger, config, partitions = common.get_common('fleet-daemon')
 daemon_start_time = datetime.datetime.now()
 
 # Obtain a list of all instances assigned to an EC2 fleet.
