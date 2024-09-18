@@ -6,7 +6,7 @@ Parameters:
     Type: AWS::EC2::VPC::Id
     Description: VPC where the headnode and the compute nodes will be launched
 
-  Subnet1Id:
+  SubnetId:
     Type: AWS::EC2::Subnet::Id
     Description: Subnet in the VPC where the headnode and the compute nodes will be launched. Must be a public subnet or a private subnet with a default route to NAT
 
@@ -24,6 +24,11 @@ Parameters:
     Default: i3en.6xlarge
     Description: Instance type to use to launch the head node. If the instance has attatched storage, this will be configured as a shared network drive.
 
+  NodeHibernateMaxTime:
+    Type: Number
+    Default: "1800"
+    Description: How many seconds should Slurm wait for a hibernated node to resume before requesting a replacement node? Set to 0 for infinite.
+
 Metadata: 
   AWS::CloudFormation::Interface: 
     ParameterGroups: 
@@ -31,26 +36,27 @@ Metadata:
           default: Network
         Parameters: 
           - VpcId
-          - Subnet1Id
+          - SubnetId
       - Label: 
           default: Instances
         Parameters: 
           - HeadNodeInstanceType
-          - ComputeNodeInstanceType
-          - ComputeNodeCPUs
           - KeyPair
           - LatestAmiId
+          - NodeHibernateMaxTime
     ParameterLabels: 
       VpcId: 
         default: VPC ID
-      Subnet1Id: 
-        default: Subnet 1 ID
+      SubnetId: 
+        default: Subnet ID
       HeadNodeInstanceType: 
         default: Headnode Instance Type
       KeyPair: 
         default: Key Pair
       LatestAmiId: 
         default: Latest cluster template AMI (created using ami_configuration_script.sh)
+      NodeHibernateMaxTime:
+        default: Time (seconds)
 
 Resources:
   SecurityGroup:
@@ -187,7 +193,7 @@ Resources:
         - !GetAtt [ SecurityGroup, GroupId ]
       SubnetId: !Ref Subnet1Id
 
-  LaunchTemplate:
+  ComputeNodeLaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
     Properties:
       LaunchTemplateData:
@@ -204,6 +210,20 @@ Resources:
           Fn::Base64:
             !Sub |
               #!/bin/bash -x
+
+              # As starting an instance from a snapshot doesn't actually sync the contents of that snapshot to 
+              # the EBS volume, we need to initialize the volume to avoid a MASSIVE performance hit if the 
+              # instance is hibernated.
+              # (Even writing to free space requires the snapshot contents to be synced from S3)
+              # Get the root device name
+              root_dev=$(lsblk --noheadings --paths --output PKNAME $( findmnt --noheadings --output SOURCE --mountpoint / ))
+              if [[ $root_dev == "" ]]; then
+                root_dev =$(findmnt --noheadings --output SOURCE --mountpoint /)
+              fi
+
+              if [[ $root_dev != "" ]]; then
+                fio --filename=$root_dev --rw=read --bs=10M --iodepth=32 --ioengine=libaio --direct=1 --name=volume-initialize &
+              fi
 
               # Start NFS and mount head node directories
               sudo rm /lib/systemd/system/nfs-common.service
@@ -263,10 +283,24 @@ Resources:
                 mount $mountdevice $mountpoint
               fi
 
+              # Don't run host verification for instances within the subnet of this VPC.
+              # Adapted from StackOverflow.
+              metadata="http://169.254.169.254/latest/meta-data"
+              mac=$(curl -s $metadata/network/interfaces/macs/ | head -n1 | tr -d '/')
+              cidr_block=$(curl -s $metadata/network/interfaces/macs/$mac/subnet-ipv4-cidr-block)
+              whitelist_ips=$(echo $cidr_block | sed 's/[.]0[.]/.*./g' | sed 's/[.]0[/].*/.*/')
+
+              cat > /home/ubuntu/.ssh/config <<EOF
+              Host $whitelist_ips
+                StrictHostKeyChecking no
+                UserKnownHostsFile=/dev/null
+              EOF
+
               # Configure NFS share
+              # Only export to instances on this subnet
               mkdir -p /nfs
-              echo "/nfs *(rw,async,no_subtree_check,no_root_squash)" | tee /etc/exports
-              echo "$mountpoint *(rw,async,no_subtree_check,no_root_squash)" | tee --append /etc/exports
+              echo "/nfs $cidr_block(rw,async,no_subtree_check,no_root_squash)" | tee /etc/exports
+              echo "$mountpoint $cidr_block(rw,async,no_subtree_check,no_root_squash)" | tee --append /etc/exports
               systemctl enable nfs-server
               systemctl start nfs-server
               exportfs -av
@@ -309,7 +343,7 @@ Resources:
                                  "InstanceInterruptionBehavior": "hibernate"
                              },
                              "LaunchTemplateSpecification": {
-                                "LaunchTemplateId": "${LaunchTemplate}",
+                                "LaunchTemplateId": "${ComputeNodeLaunchTemplate}",
                                 "Version": "$Latest"
                              },
                              "LaunchTemplateOverrides": [
@@ -344,7 +378,7 @@ Resources:
                                  "InstanceInterruptionBehavior": "hibernate"
                              },
                              "LaunchTemplateSpecification": {
-                                "LaunchTemplateId": "${LaunchTemplate}",
+                                "LaunchTemplateId": "${ComputeNodeLaunchTemplate}",
                                 "Version": "$Latest"
                              },
                              "LaunchTemplateOverrides": [
@@ -387,7 +421,7 @@ Resources:
                                  "InstanceInterruptionBehavior": "terminate"
                              },
                              "LaunchTemplateSpecification": {
-                                "LaunchTemplateId": "${LaunchTemplate}",
+                                "LaunchTemplateId": "${ComputeNodeLaunchTemplate}",
                                 "Version": "$Latest"
                              },
                              "LaunchTemplateOverrides": [
@@ -427,7 +461,7 @@ Resources:
               ReturnToService=2
               # TIMERS
               SlurmctldTimeout=300
-              SlurmdTimeout=300
+              SlurmdTimeout=${NodeHibernateMaxTime}
               InactiveLimit=0
               MinJobAge=300
               KillWait=30
@@ -538,19 +572,6 @@ Resources:
 
               # Add slurm to bashrc file
               echo export PATH=$SLURM_HOME/bin:'$PATH' >> /home/ubuntu/.bashrc
-
-              # Don't run host verification for instances within the subnet of this VPC.
-              # Adapted from StackOverflow.
-              metadata="http://169.254.169.254/latest/meta-data"
-              mac=$(curl -s $metadata/network/interfaces/macs/ | head -n1 | tr -d '/')
-              cidr_block=$(curl -s $metadata/network/interfaces/macs/$mac/subnet-ipv4-cidr-block)
-              whitelist_ips=$(echo $cidr_block | sed 's/[.]0[.]/.*./g' | sed 's/[.]0[/].*/.*/')
-
-              cat > /home/ubuntu/.ssh/config <<EOF
-              Host $whitelist_ips
-                StrictHostKeyChecking no
-                UserKnownHostsFile=/dev/null
-              EOF
 
               cfn-signal -e $? --stack ${AWS::StackName} --resource HeadNodeInstance --region ${AWS::Region}
     CreationPolicy:

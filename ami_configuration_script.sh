@@ -13,7 +13,7 @@ cat .ssh/id_ed25519.pub >> .ssh/authorized_keys
 
 # Install dependencies
 sudo apt update
-sudo apt install --yes python3 python3-pip libyaml-dev libhttp-parser-dev libjwt-dev libdbus-1-dev munge libmunge-dev openssl libssl-dev libpam-dev numactl libnuma-dev hwloc libhwloc-dev lua5.4 liblua5.4-dev libreadline-dev librrd-dev libncurses-dev libibmad-dev libibumad-dev libyaml-dev libjson-c-dev libperl-dev libcurl4-openssl-dev man2html libxi-dev default-libmysqlclient-dev libhdf5-dev libnvidia-ml-dev libpmix-dev libfreeipmi-dev librdkafka-dev liblz4-dev libglib2.0-dev libgtk2.0-dev parallel nfs-kernel-server
+sudo apt install --yes python3 python3-pip libyaml-dev libhttp-parser-dev libjwt-dev libdbus-1-dev munge libmunge-dev openssl libssl-dev libpam-dev numactl libnuma-dev hwloc libhwloc-dev lua5.4 liblua5.4-dev libreadline-dev librrd-dev libncurses-dev libibmad-dev libibumad-dev libyaml-dev libjson-c-dev libperl-dev libcurl4-openssl-dev man2html libxi-dev default-libmysqlclient-dev libhdf5-dev libnvidia-ml-dev libpmix-dev libfreeipmi-dev librdkafka-dev liblz4-dev libglib2.0-dev libgtk2.0-dev parallel nfs-kernel-server fio
 sudo bash -c 'pip3 install boto3 awscli filelock'
 sudo bash -c 'pip3 install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz'
 
@@ -57,6 +57,24 @@ PLUGIN_DIR=$SLURM_HOME/etc/aws
 sudo mkdir -p $PLUGIN_DIR
 sudo wget --directory-prefix $PLUGIN_DIR -q ${PLUGIN_GIT_URL}common.py ${PLUGIN_GIT_URL}resume.py ${PLUGIN_GIT_URL}suspend.py ${PLUGIN_GIT_URL}generate_conf.py ${PLUGIN_GIT_URL}change_state.py ${PLUGIN_GIT_URL}fleet_daemon.py
 sudo chmod +x ${PLUGIN_DIR}/*.py
+
+# Hibernation add-in script to ensure NFS is mounted before user-space processes are resumed. (i.e. running jobs)
+cat > /home/ubuntu/nfs-sync-agent <<EOF
+#!/bin/sh
+set -e
+
+if [ "\$2" = "hibernate" ] || [ "\$2" = "hybrid-sleep" ]; then
+    case "\$1" in
+        post)
+            timeout 120s ls /shared/ &>/dev/null && echo NFS online || echo NFS not mounted before timeout reached. Continuing...
+            ;;
+    esac
+fi
+EOF
+sudo mv /home/ubuntu/nfs-sync-agent /lib/systemd/system-sleep/nfs-sync-agent
+sudo chown root /lib/systemd/system-sleep/nfs-sync-agent
+sudo chgrp root /lib/systemd/system-sleep/nfs-sync-agent
+sudo chmod 755 /lib/systemd/system-sleep/nfs-sync-agent
 
 # Disable KASLR (see https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/hibernation-disable-kaslr.html)
 sudo sed -i '/^GRUB_CMDLINE_LINUX_DEFAULT/ s/"$/ nokaslr"/' /etc/default/grub.d/50-cloudimg-settings.cfg
