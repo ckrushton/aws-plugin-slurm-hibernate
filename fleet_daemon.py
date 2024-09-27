@@ -341,13 +341,38 @@ def link_nodes_to_fleet(client, fleet_instances, nodes):
                                 if "IDLE" in line and "POWERED_DOWN" in line:
                                     # Mark node as UP to prevent it from becoming an orphan.
                                     try:
-                                        common.update_node(instance_name, "state=RESUME")
-                                        logger.warning("Node %s was set as POWERED_DOWN but is active in the daemon. Setting node to UP" % instance_name)
+                                        common.update_node(instance_name, "state=POWER_UP")
+                                        logger.warning("Node %s was set as POWERED_DOWN but is active in the daemon. Setting node to POWER_UP" % instance_name)
                                     except Exception as e:
-                                        logger.error("Failed to set node %s to RESUME - %s" %(instance_name, e))
+                                        logger.error("Failed to set node %s to POWER_UP - %s" %(instance_name, e))
 
     return spot_instances, demand_instances, nodes, new_instances
 
+
+def get_spot_ids_for_stopped_instances(instance_ids):
+    """
+    Get the spot instance request IDs from a set of EC2 Instance IDs
+    """
+    try:
+        response_describe = client.describe_instances(InstanceIds=instance_ids,
+                Filters=[
+                    {'Name': 'instance-state-name', 'Values': ['stopping', 'stopped']}
+                ]
+            )
+    except Exception as e:
+        logger.critical('Failed to describe instances - %s' % e)
+
+    spot_ids = []
+    if len(response_describe["Reservations"]) == 0:
+        # No instances in fleet.
+        pass
+    else:
+        for reservation in response_describe["Reservations"]:
+            for instance in reservation["Instances"]:
+                if "SpotInstanceRequestId" in instance:
+                    spot_ids.append(instance["SpotInstanceRequestId"])
+
+    return spot_ids
 
 # Determine which fleet is associated with which partition.
 partition_fleet_ids = common.parse_fleet_ids()
@@ -436,12 +461,23 @@ for partition_name, nodegroups in partition_fleet_ids.items():
                     time.sleep(1)
                 # Spot instances.
                 if len(spot_to_remove):
+                    # Obtain the Spot request IDs for these instances
+                    spot_request_ids = get_spot_ids_for_stopped_instances(spot_to_remove)
                     try:
                         client.terminate_instances(InstanceIds=spot_to_remove)
                         logger.info('Terminated Spot Instances %s from fleet %s' % (",".join(spot_to_remove), fleet_id))
                     except Exception as e:
                         logger.error('Failed to terminate Spot Instances in fleet %s - %s' %(fleet_id, e))
                     time.sleep(1)
+                    # To prevent Spot requests from being re-fulfilled even after their stopped instance is terminated, 
+                    # cancel the associated Spot requests
+                    if len(spot_request_ids) > 0:
+                        try:
+                            client.cancel_spot_instance_requests(SpotInstanceRequestIds=spot_request_ids)
+                            logger.info('Cancelled Spot Instances Requests %s from fleet %s' % (",".join(spot_request_ids), fleet_id))
+                        except Exception as e:
+                            logger.error('Failed to cancel Spot Instances in fleet %s - %s' %(fleet_id, e))
+                        time.sleep(1)
 
                 # Allocate new instances.
                 # NOTE: As this daemon only runs once every minute, these new instances were likely started during previous daemon runs.

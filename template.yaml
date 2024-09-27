@@ -123,6 +123,7 @@ Resources:
               - Effect: Allow
                 Action:
                   - ec2:CreateFleet
+                  - ec2:CancelSpotInstanceRequests
                   - ec2:DescribeFleets
                   - ec2:DeleteFleets
                   - ec2:DescribeFleetInstances
@@ -266,6 +267,7 @@ Resources:
               # Configure local storage (if availible).
               mountpoint=/shared/
               fdisk -l
+              # NOTE: This is only tested on Ubuntu 22.04!
               localdisks=($(fdisk -l | grep -o '/dev/nvme[0-9]*n[0-9]*' | grep -v nvme0))
 
               if [[ ${!#localdisks[*]} -gt 0 ]]; then
