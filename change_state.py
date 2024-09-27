@@ -44,7 +44,7 @@ for line in lines:
 
     # In some situations, a node may be placed in COMPLETING+DRAIN state by Slurm 
     # and remains stuck. In that case, force the node to become DOWN
-    if 'COMPLETING' in node_states and 'DRAIN' in node_states:
+    if 'COMPLETING' in node_states and ('DRAIN' in node_states or 'NOT_RESPONDING' in node_states):
         change_state(node_name, 'DOWN', reason='node_stuck')
 
     # If the node is DOWN and in power saving mode, set the node to IDLE
