@@ -349,16 +349,12 @@ def link_nodes_to_fleet(client, fleet_instances, nodes):
     return spot_instances, demand_instances, nodes, new_instances
 
 
-def get_spot_ids_for_stopped_instances(instance_ids):
+def cancel_spot_requests(instance_ids, fleet_id):
     """
-    Get the spot instance request IDs from a set of EC2 Instance IDs
+    Get the spot instance request IDs for a set of EC2 Instance IDs, and cancel the associated requests
     """
     try:
-        response_describe = client.describe_instances(InstanceIds=instance_ids,
-                Filters=[
-                    {'Name': 'instance-state-name', 'Values': ['stopping', 'stopped']}
-                ]
-            )
+        response_describe = client.describe_instances(InstanceIds=instance_ids)
     except Exception as e:
         logger.critical('Failed to describe instances - %s' % e)
 
@@ -372,7 +368,14 @@ def get_spot_ids_for_stopped_instances(instance_ids):
                 if "SpotInstanceRequestId" in instance:
                     spot_ids.append(instance["SpotInstanceRequestId"])
 
-    return spot_ids
+    # Cancel requests
+    if len(spot_ids) > 0:
+        try:
+            client.cancel_spot_instance_requests(SpotInstanceRequestIds=spot_ids)
+            logger.info('Cancelled Spot Instances Requests %s from fleet %s' % (",".join(spot_ids), fleet_id))
+        except Exception as e:
+            logger.error('Failed to cancel Spot Instances in fleet %s - %s' %(fleet_id, e))
+
 
 # Determine which fleet is associated with which partition.
 partition_fleet_ids = common.parse_fleet_ids()
@@ -462,22 +465,15 @@ for partition_name, nodegroups in partition_fleet_ids.items():
                 # Spot instances.
                 if len(spot_to_remove):
                     # Obtain the Spot request IDs for these instances
-                    spot_request_ids = get_spot_ids_for_stopped_instances(spot_to_remove)
                     try:
                         client.terminate_instances(InstanceIds=spot_to_remove)
                         logger.info('Terminated Spot Instances %s from fleet %s' % (",".join(spot_to_remove), fleet_id))
                     except Exception as e:
                         logger.error('Failed to terminate Spot Instances in fleet %s - %s' %(fleet_id, e))
                     time.sleep(1)
-                    # To prevent Spot requests from being re-fulfilled even after their stopped instance is terminated, 
-                    # cancel the associated Spot requests
-                    if len(spot_request_ids) > 0:
-                        try:
-                            client.cancel_spot_instance_requests(SpotInstanceRequestIds=spot_request_ids)
-                            logger.info('Cancelled Spot Instances Requests %s from fleet %s' % (",".join(spot_request_ids), fleet_id))
-                        except Exception as e:
-                            logger.error('Failed to cancel Spot Instances in fleet %s - %s' %(fleet_id, e))
-                        time.sleep(1)
+                    # To prevent Spot requests from being re-fulfilled even after their instance is terminated, 
+                    # cancel the associated Spot requests.
+                    cancel_spot_requests(spot_to_remove, fleet_id)
 
                 # Allocate new instances.
                 # NOTE: As this daemon only runs once every minute, these new instances were likely started during previous daemon runs.
@@ -491,6 +487,9 @@ for partition_name, nodegroups in partition_fleet_ids.items():
                             client.terminate_instances(InstanceIds=[orphan])
                         except Exception as e:
                             logger.error('Failed to terminate orphan instance in fleet %s - %s' %(fleet_id, e))
+                        # If this is a Spot instance, cancel the associated request.
+                        spot_request_ids = cancel_spot_requests([orphan])
+
                 else:
                     logger.debug("No new instances currently allocated to fleet %s. Will check again later." % (fleet_id))
 
