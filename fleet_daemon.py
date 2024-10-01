@@ -82,6 +82,8 @@ def allocate_new_instances(fleet_id, new_instances, nodes_to_create):
 
                     instance_id = instance["InstanceId"]
                     ip_address = instance['PrivateIpAddress']
+                    is_spot = "SpotInstanceRequestId" in instance
+                    node_weight = "2" if is_spot else "1"  # Assign spot instances a higher priority to Slurm
                     instance_name = nodes_to_create[node_index]
                     node_index += 1
                     hostname = 'ip-%s' %'-'.join(ip_address.split('.'))
@@ -105,7 +107,7 @@ def allocate_new_instances(fleet_id, new_instances, nodes_to_create):
 
                     # Update node information in Slurm
                     try:
-                        slurm_param = 'nodeaddr=%s nodehostname=%s' %(ip_address, hostname)
+                        slurm_param = 'nodeaddr=%s nodehostname=%s weight=%s' %(ip_address, hostname, node_weight)
                         common.update_node(instance_name, slurm_param)
                         logger.debug('Updated node information in Slurm %s' % instance_name)
                     except Exception as e:
@@ -303,7 +305,8 @@ def link_nodes_to_fleet(client, fleet_instances, nodes):
             for reservation in response_describe["Reservations"]:
                 for instance in reservation["Instances"]:
                     instance_id = instance["InstanceId"]
-                    instance_ip = instance['PrivateIpAddress']
+                    instance_ip = instance["PrivateIpAddress"]
+                    instance_state = instance["State"]["Name"]
                     instance_name = None
                     for tag in instance["Tags"]:
                         if tag["Key"] == "Name":
@@ -324,27 +327,31 @@ def link_nodes_to_fleet(client, fleet_instances, nodes):
                     if instance_name in nodes:
                         nodes[instance_name] = instance_id
 
-                        # Check the IP of this, and update if necessary.
                         node_info = common.run_scommand("scontrol", ["show", "nodes", instance_name])
+                        # Aggregate the node attributes into a dictionary
+                        node_attributes = {}
                         for line in node_info:
-                            if line.startswith("   NodeAddr="):
-                                node_ip = line.split(" ")[3]
-                                node_ip = node_ip.replace("NodeAddr=", "")
-                                if node_ip != instance_ip:
-                                    logger.info("Node %s has changed IP address from %s to %s. Updating" % (instance_name, node_ip, instance_ip))
-                                    slurm_param = 'nodeaddr=%s nodehostname=%s' %(instance_ip, instance_name)
-                                    common.update_node(instance_name, slurm_param)
-                            # Check to make sure this node is not flagged as POWERED_DOWN. If so, it ran into a race condition where it was re-requested by Slurm at the same time
-                            # it was marked as POWERED_DOWN.
-                            # Mark it as UP to give Slurm the chance to use it again, or power it down.
-                            if line.startswith("   State="):
-                                if "IDLE" in line and "POWERED_DOWN" in line:
-                                    # Mark node as UP to prevent it from becoming an orphan.
-                                    try:
-                                        common.update_node(instance_name, "state=POWER_UP")
-                                        logger.warning("Node %s was set as POWERED_DOWN but is active in the daemon. Setting node to POWER_UP" % instance_name)
-                                    except Exception as e:
-                                        logger.error("Failed to set node %s to POWER_UP - %s" %(instance_name, e))
+                            line_split = [i for i in line.split(' ') if '=' in i]
+                            node_attributes.update({i.split('=')[0]: i.split('=')[1] for i in line_split})
+                        
+                        node_states = node_attributes['State'].split('+')  # A node should have multiple states like IDLE+CLOUD+POWER
+
+                        # Check the IP of this, and update if necessary.
+                        if node_attributes["NodeAddr"] != instance_ip:
+                            logger.info("Node %s has changed IP address from %s to %s. Updating" % (instance_name, node_attributes["NodeAddr"], instance_ip))
+                            slurm_param = 'nodeaddr=%s nodehostname=%s' %(instance_ip, instance_name)
+                            common.update_node(instance_name, slurm_param)
+
+                        # Check to make sure this node is not flagged as POWERED_DOWN. If so, it ran into a race condition where it was re-requested by Slurm at the same time
+                        # it was marked as POWERED_DOWN.
+                        # Mark it as UP to give Slurm the chance to use it again, or power it down.
+                        if "IDLE" in node_states and "POWERED_DOWN" in node_states:
+                            # Mark node as UP to prevent it from becoming an orphan.
+                            try:
+                                common.update_node(instance_name, "state=POWER_UP")
+                                logger.warning("Node %s was set as POWERED_DOWN but is active in the daemon. Setting node to POWER_UP" % instance_name)
+                            except Exception as e:
+                                logger.error("Failed to set node %s to POWER_UP - %s" %(instance_name, e))
 
     return spot_instances, demand_instances, nodes, new_instances
 
