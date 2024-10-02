@@ -2,10 +2,8 @@
 import json
 import logging
 import os
-import re
 import subprocess
 import sys
-import boto3
 
 
 dir_path = os.path.dirname(os.path.realpath(__file__))  # Folder where resides the Python files
@@ -47,68 +45,34 @@ def get_logger(scriptname, levelname, filename):
     return logger
 
 
-# Validate the structure of the config.json file content
-# - data: dict loaded from config.json
-def validate_config(data):
+def validate_config(config):
 
-    assert 'LogLevel' in data, 'Missing "LogLevel" in root'
-    assert data['LogLevel'] in ('CRITICAL', 'ERROR', 'WARNING', 'INFO', 'DEBUG'), 'root["LogLevel"] is an invalid value'
+    assert "LogLevel" in config
+    assert config["LogLevel"] in ("CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"), "Invalid log level specified"
+    assert "LogFileName" in config
+    assert "SlurmBinPath" in config
+    assert "Region" in config
+    assert "SlurmConf" in config
+    
+    assert "Partitions" in config
+    assert "PartitionOptions" in config
 
-    assert 'LogFileName' in data, 'Missing "LogFileName" in root'
+    # Check partition formatting.
+    for partition_name, nodegroups in config["Partitions"].items():
+        # Check nodegroups in this partition.
+        for nodegroup_name, nodegroup_attributes in nodegroups.items():
+            assert "NumNodes" in nodegroup_attributes
+            
+            assert "PurchasingOption" in nodegroup_attributes
+            assert nodegroup_attributes["PurchasingOption"] in ("spot", "on-demand")
+            
+            assert "InteruptionBehavior" in nodegroup_attributes
+            assert nodegroup_attributes["InteruptionBehavior"] in ("stop", "terminate", "hibernate")
 
-    assert 'SlurmBinPath' in data, 'Missing "SlurmBinPath" in root'
+            assert "LaunchTemplate" in nodegroup_attributes
+            assert "SubnetIds" in nodegroup_attributes
 
-    assert 'SlurmConf' in data, 'Missing "SlurmConf" in root'
-    slurm_conf = data['SlurmConf']
-    assert isinstance(slurm_conf, dict), 'root["SlurmConf"] is not a dict'
-
-    assert 'PrivateData' in slurm_conf, 'Missing "PrivateData" in root["SlurmConf"]'
-    assert 'ResumeProgram' in slurm_conf, 'Missing "ResumeProgram" in root["SlurmConf"]'
-    assert 'SuspendProgram' in slurm_conf, 'Missing "SuspendProgram" in root["SlurmConf"]'
-    assert 'ResumeRate' in slurm_conf, 'Missing "ResumeRate" in root["SlurmConf"]'
-    assert 'SuspendRate' in slurm_conf, 'Missing "SuspendRate" in root["SlurmConf"]'
-    assert 'ResumeTimeout' in slurm_conf, 'Missing "ResumeTimeout" in root["SlurmConf"]'
-    assert 'SuspendTime' in slurm_conf, 'Missing "SuspendTime" in root["SlurmConf"]'
-    assert 'TreeWidth' in slurm_conf, 'Missing "TreeWidth" in root["SlurmConf"]'
-
-
-# Validate the structure of the partitions.json file content
-# - data: dict loaded from partitions.json
-def validate_partitions(data):
-
-    assert 'Partitions' in data, 'Missing "Partitions" in root'
-    assert isinstance(data['Partitions'], list), 'root["Partitions"] is not an array'
-
-    for i_partition, partition in enumerate(data['Partitions']):
-        assert 'PartitionName' in partition, 'Missing "PartitionName" in root["Partitions"][%s]' %i_partition
-        assert re.match('^[a-zA-Z0-9]+$', partition['PartitionName']), 'root["Partitions"][%s]["PartitionName"] does not match ^[a-zA-Z0-9]+$' %i_partition
-
-        assert 'NodeGroups' in partition, 'Missing "NodeGroups" in root["Partitions"][%s]' %i_partition
-        assert isinstance(partition['NodeGroups'], list), 'root["Partitions"][%s]["NodeGroups"] is not an array' %i_partition
-
-        for i_nodegroup, nodegroup in enumerate(partition['NodeGroups']):
-            assert 'NodeGroupName' in nodegroup, 'Missing "NodeGroupName" in root["Partitions"][%s]["NodeGroups"][%s]' %(i_partition, i_nodegroup)
-            assert re.match('^[a-zA-Z0-9]+$', nodegroup['NodeGroupName']), 'root["Partitions"][%s]["NodeGroups"][%s]["NodeGroupName"] does not match ^[a-zA-Z0-9]+$' %(i_partition, i_nodegroup)
-
-            assert 'MaxNodes' in nodegroup, 'Missing "MaxNodes" in root["Partitions"][%s]["NodeGroups"][%s]' %(i_partition, i_nodegroup)
-            assert isinstance(nodegroup['MaxNodes'], int), 'root["Partitions"][%s]["NodeGroups"][%s]["MaxNodes"] is not a number' %(i_partition, i_nodegroup)
-
-            assert 'Region' in nodegroup, 'Missing "Region" in root["Partitions"][%s]["NodeGroups"][%s]' %(i_partition, i_nodegroup)
-
-            assert 'PurchasingOption' in nodegroup, 'Missing "PurchasingOption" in root["Partitions"][%s]["NodeGroups"][%s]' %(i_partition, i_nodegroup)
-            assert nodegroup['PurchasingOption'] in ('spot', 'on-demand'), 'root["Partitions"][%s]["NodeGroups"][%s]["PurchasingOption"] must be spot or on-demand' %(i_partition, i_nodegroup)
-
-            assert 'LaunchTemplateSpecification' in nodegroup, 'Missing "LaunchTemplateSpecification" in root["Partitions"][%s]["NodeGroups"][%s]' %(i_partition, i_nodegroup)
-            assert isinstance(nodegroup['LaunchTemplateSpecification'], dict), 'root["Partitions"][%s]["NodeGroups"][%s]["LaunchTemplateSpecification"] is not a dict' %(i_partition, i_nodegroup)
-
-            assert 'LaunchTemplateOverrides' in nodegroup, 'Missing "LaunchTemplateOverrides" in root["Partitions"][%s]["NodeGroups"][%s]' %(i_partition, i_nodegroup)
-            assert isinstance(nodegroup['LaunchTemplateOverrides'], list), 'root["Partitions"][%s]["NodeGroups"][%s]["LaunchTemplateOverrides"] is not a dict' %(i_partition, i_nodegroup)
-
-            assert 'SubnetIds' in nodegroup, 'Missing "SubnetIds" in root["Partitions"][%s]["NodeGroups"][%s]' %(i_partition, i_nodegroup)
-            assert isinstance(nodegroup['SubnetIds'], list), 'root["Partitions"][%s]["NodeGroups"][%s]["SubnetIds"] is not a dict' %(i_partition, i_nodegroup)
-
-        if 'PartitionOptions' in partition:
-            assert isinstance(partition['PartitionOptions'], dict), 'root["Partitions"][%s]["PartitionOptions"] is not a dict' %(i_partition)
+            assert "Instances" in nodegroup_attributes
 
 
 # Create and return logger, config, and partitions variables
@@ -126,14 +90,11 @@ def get_common(scriptname):
     except Exception as e:
         config = {'JsonLoadError': str(e)}
 
-    # Populate default values if unspecified
-    if not 'LogFileName' in config:
-        config['LogFileName'] = '%s/aws_plugin.log' %dir_path
-    if not 'LogLevel' in config:
-        config['LogLevel'] = 'DEBUG'
+    with open(config_filename, 'r') as f:
+        config = json.load(f)
 
     # Make sure that SlurmBinPath ends with a /
-    if 'SlurmBinPath' in config and not config['SlurmBinPath'].endswith('/'):
+    if  not config['SlurmBinPath'].endswith('/'):
         config['SlurmBinPath'] += '/'
 
     # Create a logger
@@ -147,64 +108,17 @@ def get_common(scriptname):
         validate_config(config)
     except Exception as e:
         logger.critical('File config.json is invalid - %s' %e)
-        sys.exit(1)
+        raise e
 
-    # Load partitions details from ./partitions.json
-    partitions_filename = '%s/partitions.json' %dir_path
-    try:
-        with open(partitions_filename, 'r') as f:
-            partitions_json = json.load(f)
-    except Exception as e:
-        logger.critical('Failed to load %s - %s' %(partitions_filename, e))
-        sys.exit(1)
-
-    # Validate the structure of partitions.json
-    try:
-        validate_partitions(partitions_json)
-    except Exception as e:
-        logger.critical('File partition.json is invalid - %s' %e)
-        sys.exit(1)
-    finally:
-        partitions = partitions_json['Partitions']
-
-    return logger, config, partitions
+    return logger, config
 
 
-# Return the name of a node [partition_name]-[nodegroup_name][id]
-# - partition: can either be a string, or a dict with dict['PartitionName'] = partition_name
-# - nodegroup: can either be a string, or a dict with dict['NodeGroupName'] = nodegroup_name
-# - id: optional id
-def get_node_name(partition, nodegroup, node_id=''):
+# Use 'scontrol update node' to update nodes
+def update_node(node_name, parameters):
 
-    if isinstance(partition, dict):
-        partition_name = partition['PartitionName']
-    else:
-        partition_name = partition
-
-    if isinstance(nodegroup, dict):
-        nodegroup_name = nodegroup['NodeGroupName']
-    else:
-        nodegroup_name = nodegroup
-
-    if node_id == '':
-        return '%s-%s' %(partition_name, nodegroup_name)
-    else:
-        return '%s-%s-%s' %(partition_name, nodegroup_name, node_id)
-
-
-# Return the name of a node [partition_name]-[nodegroup_name][id]
-# - partition: can either be a string, or a dict with dict['PartitionName'] = partition_name
-# - nodegroup: can either be a string, or a dict with dict['NodeGroupName'] = nodegroup_name
-# - nb_nodes: optional number of nodes
-def get_node_range(partition, nodegroup, nb_nodes=None):
-
-    if nb_nodes is None:
-        nb_nodes = nodegroup['MaxNodes']
-
-    if nb_nodes > 1:
-        return '%s-[0-%s]' %(get_node_name(partition, nodegroup), nb_nodes-1)
-    else:
-        return '%s-0' %(get_node_name(partition, nodegroup))
+    parameters_split = parameters.split(' ')
+    arguments = ['update', 'nodename=%s' %node_name] + parameters_split
+    run_scommand('scontrol', arguments)
 
 
 # Run scontrol and return output
@@ -218,111 +132,3 @@ def run_scommand(command, arguments):
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
     lines = proc.communicate()[0].splitlines()
     return [line.decode() for line in lines]
-
-
-# The slurm.conf will have a comment line specifying the fleet ID for each partition.
-# Returns a dictionary with the partition_name: fleet_id
-def parse_fleet_ids():
-
-    # Determine the location of slurm.conf from slurmctl.
-    args = ['show', 'config']
-    scontrol_output = run_scommand('scontrol', args)
-    slurm_config_path = ""
-
-    # Look for the SLURM_CONF entry to find the config path.
-    for line in scontrol_output:
-        line = line.rstrip("\r\n")
-        if line.startswith("SLURM_CONF"):
-            cols = line.split(" = ")
-            slurm_config_path = cols[1]
-
-    # Sanity check.
-    if not os.path.exists(slurm_config_path):
-        logger.error('Unable to locate slurm.conf at %s' % (slurm_config_path))
-        return {}
-
-    # Parse the slurm.conf and obtain the fleet IDs.
-    fleet_ids = {}
-    with open(slurm_config_path) as f:
-        for line in f:
-            line = line.rstrip("\r\n")
-            if line.startswith("#EC2_FLEET"):
-                # Fleet ID line. Parse this.
-                cols = line.split(" ")
-                partition = cols[1]
-                nodegroup = cols[2]
-                fleet_id = cols[3]
-                if partition not in fleet_ids:
-                    fleet_ids[partition] = {}
-                fleet_ids[partition][nodegroup] = fleet_id
-
-    return fleet_ids
-
-
-# Use 'scontrol show hostnames' to expand the hostlist and return a list of node names
-# - hostlist: argument passed to SuspendProgram or ResumeProgram
-def expand_hostlist(hostlist):
-
-    try:
-        arguments = ['show', 'hostnames', hostlist]
-        return run_scommand('scontrol', arguments)
-    except Exception as e:
-        logger.critical('Failed to expand hostlist - %s' %e)
-        sys.exit(1)
-
-
-# Take a list of node names in input and return a dict with result[partition_name][nodegroup_name] = list of node ids
-def parse_node_names(node_names):
-    result = {}
-    for node_name in node_names:
-
-        # For each node: extract partition name, node group name and node id
-        pattern = '^([a-zA-Z0-9]+)-([a-zA-Z0-9]+)-([0-9]+)$'
-        match = re.match(pattern, node_name)
-        if match:
-            partition_name, nodegroup_name, node_id = match.groups()
-
-            # Add to result
-            if not partition_name in result:
-                result[partition_name] = {}
-            if not nodegroup_name in result[partition_name]:
-                result[partition_name][nodegroup_name] = []
-            result[partition_name][nodegroup_name].append(node_id)
-
-    return result
-
-
-# Return a pointer in partitions to a specific partition and node group
-def get_partition_nodegroup(partition_name, nodegroup_name):
-
-    for partition in partitions:
-        if partition['PartitionName'] == partition_name:
-            for nodegroup in partition['NodeGroups']:
-                if nodegroup['NodeGroupName'] == nodegroup_name:
-                    return nodegroup
-
-    # Return None if it does not exist
-    return None
-
-
-# Use 'scontrol update node' to update nodes
-def update_node(node_name, parameters):
-
-    parameters_split = parameters.split(' ')
-    arguments = ['update', 'nodename=%s' %node_name] + parameters_split
-    run_scommand('scontrol', arguments)
-
-
-# Return boto3 client
-def get_ec2_client(nodegroup):
-
-    if 'ProfileName' in nodegroup:
-        try:
-            session = boto3.session.Session(region_name=nodegroup['Region'], profile_name=nodegroup['ProfileName'])
-            return session.client('ec2')
-        except Exception as e:
-            logger.critical('Failed to create a EC2 client - %s' %e)
-            sys.exit(1)
-    else:
-        return boto3.client('ec2', region_name=nodegroup['Region'])
-

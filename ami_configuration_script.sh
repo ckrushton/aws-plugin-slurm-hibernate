@@ -55,7 +55,7 @@ echo export PATH=${SLURM_HOME}/bin:'$PATH' >> /home/ubuntu/.bashrc
 # Setup Slurm EC2 plugin
 PLUGIN_DIR=$SLURM_HOME/etc/aws
 sudo mkdir -p $PLUGIN_DIR
-sudo wget --directory-prefix $PLUGIN_DIR -q ${PLUGIN_GIT_URL}common.py ${PLUGIN_GIT_URL}resume.py ${PLUGIN_GIT_URL}suspend.py ${PLUGIN_GIT_URL}generate_conf.py ${PLUGIN_GIT_URL}change_state.py ${PLUGIN_GIT_URL}fleet_daemon.py
+sudo wget --directory-prefix $PLUGIN_DIR -q ${PLUGIN_GIT_URL}common.py ${PLUGIN_GIT_URL}resume.py ${PLUGIN_GIT_URL}suspend.py ${PLUGIN_GIT_URL}generate_conf.py ${PLUGIN_GIT_URL}fleet_daemon.py
 sudo chmod +x ${PLUGIN_DIR}/*.py
 
 # Hibernation add-in script to ensure NFS is mounted before user-space processes are resumed. (i.e. running jobs)

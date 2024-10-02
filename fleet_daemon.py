@@ -3,242 +3,14 @@
 # Adapted from https://github.com/aws-samples/aws-plugin-for-slurm
 
 import boto3
-import datetime
 import filelock
-import json
 import os
 import time
+import json
 
 import common
 
-logger, config, partitions = common.get_common('fleet-daemon')
-daemon_start_time = datetime.datetime.now()
-
-# Obtain a list of all instances assigned to an EC2 fleet.
-def get_fleet_instances(fleet_id):
-
-    # Get a list of instances allocated with this fleet.
-    try:
-        # We include stopping and stopped instances, as those could be in the process of hibernation.
-        fleet_filters = [{"Name": "tag:aws:ec2:fleet-id", "Values": [fleet_id]}, {"Name": "instance-state-name", "Values": ["pending", "running", "stopping", "stopped"]}]
-        instance_response = client.describe_instances(Filters=fleet_filters)
-        logger.debug("DescribeFleetInstances Response:" + json.dumps(instance_response,indent=4,default=str))
-        instances = []
-        if len(instance_response["Reservations"]) > 0:  # There are instances allocated to this fleet.
-            for reservation in instance_response["Reservations"]:
-                instances.extend(x["InstanceId"] for x in reservation["Instances"])
-    except Exception as e:
-        logger.error('Failed to describe fleet instances for %s: %s' % (fleet_id, e))
-        instances = []
-
-    return instances
-
-
-def get_fleet_region_type(partitions):
-
-    partition_regions = {}
-    partition_type = {}
-    for partition in partitions:
-        partition_name = partition["PartitionName"]
-        partition_regions[partition_name] = {}
-        partition_type[partition_name] = {}
-
-        for nodegroup in partition["NodeGroups"]:
-            nodegroup_name = nodegroup["NodeGroupName"]
-            nodegroup_region = nodegroup["Region"]
-            nodegroup_type = nodegroup["PurchasingOption"]
-            partition_regions[partition_name][nodegroup_name] = nodegroup_region
-            partition_type[partition_name][nodegroup_name] = nodegroup_type
-
-    return partition_regions, partition_type
-
-
-def allocate_new_instances(fleet_id, new_instances, nodes_to_create):
-
-    node_index = 0
-    # Alloocate and name the new instances
-    if len(new_instances) == 0:
-        # No new instances in fleet.
-        pass
-    else:
-        try:
-            response_describe = client.describe_instances(InstanceIds=new_instances,
-                Filters=[
-                    {'Name': 'instance-state-name', 'Values': ['pending', 'running', 'stopping', 'stopped']}
-                ]
-            )
-        except Exception as e:
-            logger.critical('Failed to describe instances in fleet %s - %s' % (fleet_id, e))
-
-        if len(response_describe["Reservations"]) > 0:
-            # At least one node was allocated.
-
-            for reservation in response_describe["Reservations"]:
-                for instance in reservation["Instances"]:
-
-                    # Already allocated sufficient instances.
-                    if node_index == len(nodes_to_create):
-                        break
-
-                    instance_id = instance["InstanceId"]
-                    ip_address = instance['PrivateIpAddress']
-                    instance_name = nodes_to_create[node_index]
-                    node_index += 1
-                    hostname = 'ip-%s' %'-'.join(ip_address.split('.'))
-
-                    logger.info('Launched node %s %s %s' %(instance_name, instance_id, ip_address))
-
-                    # Tag the instance
-                    new_tags =  [
-                        {
-                            'Key': "Name",
-                            'Value': instance_name
-                        }
-                    ]
-
-                    try:
-                        client.create_tags(Resources=[instance_id], Tags=new_tags)
-                        logger.debug('Tagged node %s: %s' %(instance_id, json.dumps(new_tags, indent=4)))
-                    except Exception as e:
-                        logger.error('Failed to tag node %s - %s' %(instance_id, e))
-                        continue
-
-                    # Update node information in Slurm
-                    try:
-                        slurm_param = 'nodeaddr=%s nodehostname=%s' %(ip_address, hostname)
-                        common.update_node(instance_name, slurm_param)
-                        logger.debug('Updated node information in Slurm %s' % instance_name)
-                    except Exception as e:
-                        logger.error('Failed to update node information in Slurm %s - %s' %(instance_name, e))
-
-                    # Update hostsfile with new node IP
-                    update_hosts_file(instance_name, ip_address)
-
-                    try:
-                        new_instances.remove(instance_id)
-                    except ValueError:
-                        pass
-
-    return node_index, new_instances
-
-
-# Check a fleet history to determine if we have been waiting on new instances for a prolonged period of time
-def spot_allocation_timeout(client, fleet_id, timeout_seconds=300):
-
-    # Check the fleet history from a minute ago, to ensure all the events have been updated
-    start_time = daemon_start_time - datetime.timedelta(seconds=timeout_seconds)
-
-    start_time = '{:%Y-%m-%dT%H:%M:00Z}'.format(start_time)
-
-    # Sanity check that this fleet is not stuck modifying.
-    # This can occur if the fleet is blacklisted, and we don't want to make the situation worse.
-    try:
-        describe_fleet_response = client.describe_fleets(FleetIds=[fleet_id])
-        fleet_info = describe_fleet_response["Fleets"][0]
-    except Exception as e:
-        logger.error("Failed to describe fleet %s - %s" % (fleet_id, e))
-        return False
-
-    # Is the fleet is currently being edited?
-    if fleet_info["FleetState"] == "modifying":
-        return False
-
-    try:
-        fleet_history = client.describe_fleet_history(FleetId=fleet_id, StartTime=start_time)
-    except Exception as e:
-        logger.error("Failed to describe fleet history %s - %s" % (fleet_id, e))
-        return False  # Assume the fleet has not timed out, as we cannot check it.
-
-    # Remove periodic stop bid updates.
-    fleet_events = list(x for x in fleet_history["HistoryRecords"] if x["EventType"] != "spotInstanceRequestChange")
-
-    # Check to see if there have been any updates to the fleet in the prescribed period of time.
-    if len(fleet_events) == 0:
-       logger.warning("Fleet %s has not been updated for more than %s seconds, despite requesting additional capacity" % (fleet_id, timeout_seconds))
-       # No events.
-       return True
-
-    # Is the most recent event warning about spot capacity?
-    last_record = fleet_events[-1]
-    if last_record["EventType"] == "error":
-        last_record_event = last_record["EventInformation"]["EventSubType"]
-        if last_record_event == "spotInstanceCountLimitExceeded" or last_record_event == "spotFleetRequestConfigurationInvalid":
-            # We are out of spot capacity.
-            logger.warning("Fleet %s is out of spot capacity - %s" % (fleet_id, last_record_event))
-            return True
-        if last_record_event == "allLaunchSpecsTemporarilyBlacklisted":
-            # We have not been very elegant, and there have been repeted problems launching instances.
-            # We have been blacklisted for a few minutes.
-            logger.warning("Fleet %s is currently blacklisted and will not be further modified - %s" % (fleet_id, last_record))
-
-    return False
-
-
-# Convert any unallocated spot capacity to on-demand capacity.
-def spot_fallback_to_demand(client, fleet_id, target_capacity):
-
-    # Get the instances currently assigned to this fleet
-    fleet_instances = get_fleet_instances(fleet_id)
-
-    # How many spot instances are allocated?
-    try:
-        describe_response = client.describe_instances(InstanceIds=fleet_instances, Filters=[
-                    {'Name': 'instance-state-name', 'Values': ['pending', 'running', 'stopping', 'stopped']},
-                    {"Name": "instance-lifecycle", "Values": ["spot"]}
-                ])
-    except Exception as e:
-        logger.warning("Unable to describe spot instances in fleet %s - %s" % (fleet_id, e))
-
-    num_spot_allocated = sum(len(x["Instances"]) for x in describe_response["Reservations"])
-
-    # How many additional On-Demand instances should we request?
-    target_od = target_capacity - num_spot_allocated
-
-    # Adjust the size of the requested fleet
-    fleet_command = {"TotalTargetCapacity": target_capacity, "OnDemandTargetCapacity": target_od, "SpotTargetCapacity": num_spot_allocated}
-    logger.debug("Modifying size of fleet %s to %s" % (fleet_id, fleet_command))
-    try:
-        change_fleet_response = client.modify_fleet(FleetId=fleet_id, TargetCapacitySpecification=fleet_command, ExcessCapacityTerminationPolicy="no-termination")
-    except Exception as e:
-        logger.error('Failed to update fleet size for %s: %s' % (fleet_id, e))
-
-
-# Adjust the size of an EC2 Fleet Request.
-def adjust_fleet_size(client, fleet_id, target_size, num_od_remove, fleet_type):
-
-    # Obtain the current size of the fleet
-    try:
-        describe_fleet_response = client.describe_fleets(FleetIds=[fleet_id])
-        fleet_size = describe_fleet_response["Fleets"][0]["TargetCapacitySpecification"]
-    except Exception as e:
-        logger.error("Failed to describe fleet %s - %s" % (fleet_id, e))
-        return False
-
-    # Do we need to adjust the size of the fleet?
-    if target_size == fleet_size["TotalTargetCapacity"] and num_od_remove == 0:
-        return True
-    
-    # Need to resize the fleet.
-    # Is this a spot fleet on on-demand?
-    od_capacity = fleet_size["OnDemandTargetCapacity"]
-    if fleet_type == "spot":
-        # As this is a spot fleet, if there are On-Demand instances allocated (as a fallback) which need to be shut down
-        # reduce the allocation of On-Demand instances accordingly
-        on_demand_target = od_capacity - num_od_remove
-        fleet_command = {"TotalTargetCapacity": num_nodes, "OnDemandTargetCapacity": on_demand_target, "SpotTargetCapacity": num_nodes - on_demand_target}
-    else:  # On-demand.
-        # NOTE: We shouldn't have spot instances in an On-Demand fleet (as we won't fall back to spot instances if On-Demand can't be allocated!),
-        # so this is a lot simplier than handling spot fleets.
-        # Just set the capacity to the target capacity.
-        fleet_command = {"TotalTargetCapacity": num_nodes, "OnDemandTargetCapacity": num_nodes, "SpotTargetCapacity": 0}
-
-    logger.debug("Modifying size of fleet %s to %s" % (fleet_id, fleet_command))
-    try:
-        change_fleet_response = client.modify_fleet(FleetId=fleet_id, TargetCapacitySpecification=fleet_command, ExcessCapacityTerminationPolicy="no-termination")
-    except Exception as e:
-        logger.error('Failed to update fleet size for %s: %s' % (fleet_id, e))
-
-    return True
+logger, config = common.get_common("fleet-daemon")
 
 
 # Update /etc/hosts with the IP of this new node
@@ -275,233 +47,310 @@ def update_hosts_file(node_name, ip, hostfile="/etc/hosts"):
         logger.warning("Unable to update hostfile %s - %s" % (hostfile, e))
 
 
-# Compare the nodes that are currently running to those present in the fleet, and determine what chages are required.
-def link_nodes_to_fleet(client, fleet_instances, nodes):
+def allocate_instance(instance, node_name, weight=1):
+    
+    instance_id = instance["InstanceId"]
+    instance_ip = instance["PrivateIpAddress"]
+    # Assign the appropriate name to this node.
+    try:
+        client.create_tags(Resources = [instance_id], Tags=[{"Key": "Name", "Value": node_name}])
+    except Exception as e:
+        logger.warning("Unable to assign instance %s name %s - %s" % (instance_id, node_name, e))
+    # Allocate this new node to Slurm
+    common.update_node(node_name, "nodeaddr=%s nodehostname=%s comment=InstanceId:%s weight=%s" % (instance_ip, node_name, instance_id, weight))
+    update_hosts_file(node_name, instance_ip)
 
-    spot_instances = {}
-    demand_instances = {}
-    new_instances = []
 
-    if len(fleet_instances) > 0:
-        # Instances are already allocated to these fleets
-        # Parse information from instances.
-        try:
-            response_describe = client.describe_instances(InstanceIds=list(fleet_instances),
-                Filters=[
-                    {'Name': 'instance-state-name', 'Values': ['pending', 'running', 'stopping', 'stopped']}
-                ]
-            )
-        except Exception as e:
-            logger.critical('Failed to describe instances in partition %s - %s' % (partition_name, e))
-            return {}, {}, {}, []
+# Request new EC2 instances and assign to Slurm nodes.
+def request_new_instances(client, new_nodes, config, nodegroup):
 
-        # Get detailed instance information for this fleet.
-        if len(response_describe["Reservations"]) == 0:
-            # No instances in fleet.
-            pass
+    num_new_nodes=len(new_nodes)
+    num_allocated = 0
+    launch_template = config["LaunchTemplate"]
+    is_spot = config["PurchasingOption"] == "spot"
+    interrupt_behavior = config["InteruptionBehavior"]
+
+    tag_specifications = [
+        {"ResourceType": "instance",
+         "Tags": [
+                {"Key": "nodegroup",
+                 "Value": nodegroup
+                 }
+            ]
+        }
+    ]
+    market_options = {}
+    if is_spot:
+        market_options = {"MarketType": "spot",
+                          "SpotOptions": {
+                              "SpotInstanceType": "persistent",
+                              "InstanceInterruptionBehavior": interrupt_behavior
+                          }
+                          }
+
+        # Try to allocate spot instances first.
+        for instance_type in config["Instances"]:
+            for subnet in config["SubnetIds"]:
+                try:
+                    num_outstanding_nodes = num_new_nodes - num_allocated
+                    logger.debug("Requesting %s spot instances of type %s in subnet %s" % (num_outstanding_nodes, instance_type, subnet))
+                    instance_response = client.run_instances(LaunchTemplate={"LaunchTemplateId" :launch_template}, InstanceType=instance_type, MinCount=1, MaxCount=num_outstanding_nodes, SubnetId=subnet,
+                                    InstanceMarketOptions=market_options, TagSpecifications=tag_specifications)
+                    logger.debug("Run Instance response - %s" % json.dumps(instance_response,indent=4,default=str))
+                    # Did we manage to allocate nodes?
+                    for instance in instance_response["Instances"]:
+                        node_name = new_nodes[num_allocated]
+                        allocate_instance(instance, node_name, weight=2)
+                        num_allocated += 1
+
+                    # To not flood AWS API with requests.
+                    time.sleep(0.2)
+
+                except Exception as e:
+                    logger.info("Unable to fullfill spot request for %s %s instances in subnet %s - %s" % (num_outstanding_nodes, instance_type, subnet, e))
+
+                if num_allocated == num_new_nodes:
+                    break
+            if num_allocated == num_new_nodes:
+                break
+
+    # If this is an on-demand fleet or we can't allocate spot instances, request on-demand instances.
+    if num_allocated < num_new_nodes:
+        for instance_type in config["Instances"]:
+            for subnet in config["SubnetIds"]:
+                try:
+                    num_outstanding_nodes = num_new_nodes - num_allocated
+                    logger.debug("Requesting %s On-Demand Instances of type %s in subnet %s" % (num_outstanding_nodes, instance_type, subnet))
+                    instance_response = client.run_instances(LaunchTemplate={"LaunchTemplateId" :launch_template}, InstanceType=instance_type, MinCount=1, 
+                                                             MaxCount=num_outstanding_nodes, SubnetId=subnet, TagSpecifications=tag_specifications)
+                    logger.debug("Run Instance response - %s" % json.dumps(instance_response,indent=4,default=str))
+                    # Did we manage to allocate nodes?
+                    for instance in instance_response["Instances"]:
+                        node_name = new_nodes[num_allocated]
+                        allocate_instance(instance, node_name, weight=1)
+                        num_allocated += 1
+
+                    # To not flood AWS API with requests.
+                    time.sleep(0.2)
+
+                except Exception as e:
+                    logger.info("Unable to fullfill On-Demand request for %s %s instances in subnet %s - %s" % (num_outstanding_nodes, instance_type, subnet, e))
+
+                if num_allocated == num_new_nodes:
+                    break
+            if num_allocated == num_new_nodes:
+                break
+
+    if num_allocated < num_new_nodes:
+        # If we can't allocate enough instances right now, that is okay, we will try again the next time the daemon is run.
+        logger.warning("Unable launch %s instances" % num_outstanding_nodes)
+
+
+# Compare the nodes that are currently running to those present in the fleet, and determine what changes are required.
+def process_fleet_nodes(client, nodes, instances):
+
+    nodes_to_create = []
+    seen_instances = []
+
+    # Process all nodes in this partition and nodegroup.
+    for node_name, node_attributes in nodes.items():
+        # Has this node been associated with an EC2 instance?
+        logger.info("Processing node %s" % node_name)
+        
+        instance_id = None
+        instance_attributes = {}
+
+        if "Comment" in node_attributes:
+            instance_id = node_attributes["Comment"]["InstanceId"]
+            if instance_id == "":
+                instance_id = None
+            else:
+                logger.info("Node %s is linked to instance %s" % (node_name, instance_id))
+                try:
+                    instance_attributes = instances[instance_id]
+                    seen_instances.append(instance_id)
+                    logger.debug("Instance detail for %s: %s" % (instance_id, instance_attributes))
+                except KeyError:  # This instance was likely terminated a long time ago.
+                    instance_id = None
+
+        node_states = set(node_attributes["State"])
+
+        # If this node has been powered down because it went down, reset it and set it to idle.
+        # Let the node fully power down first so we don't overwhelm Slurm.
+        if "DOWN" in node_states and "POWERED_DOWN" in node_states:
+            logger.info("Node %s is POWERED_DOWN because it went DOWN. Resetting..." % node_name)
+            common.update_node(node_name, "state=IDLE")
+
+        elif instance_id is None:
+            # No instance is allocated to this node.
+            if "POWERING_UP" in node_states:
+                # We need to allocate an instance to this node.
+                nodes_to_create.append(node_name)
+            elif "POWERED_DOWN" in node_states or "POWERING_DOWN" in node_states:
+                # Node is powered down, and no instance is linked. This is the appropriate senario.
+                pass
+            else:
+                # Node is up, but there is no associated instance (was it terminated outside of Slurm's control?)
+                # Set this node to DOWN.
+                common.update_node(node_name, "state=POWER_DOWN_FORCE reason=instance_terminated")
         else:
+            # An instance is allocated to this node.
+            # Check to ensure the IP address for the node is correct.
+            instance_ip = instance_attributes["PrivateIpAddress"]
+            # If this node is powered down, terminate the associated instance.
+            if "POWERED_DOWN" in node_states or "POWERING_DOWN" in node_states:
+                # If there is still an EC2 instance linked with this node, terminate it.
+                if instance_attributes["State"]["Name"] not in ["terminated", "stopping"]:
+                    logger.info("Node %s is set to POWER_DOWN. Terminating linked instance %s" % (node_name, instance_id))
+                    terminate_instance(client, instance_id, instance_attributes)
+                    # Remove this linked node, as it is terminated.
+                    common.update_node(node_name, "Comment=InstanceId:")
+            # Instance is UP
+            elif instance_ip != node_attributes["NodeAddr"]:
+                logger.info("Node %s is assigned an IP address of %s, but linked instance %s has an IP address of %s. Updating..." % (node_name, node_attributes["NodeAddr"], instance_id, instance_ip))
+                common.update_node(node_name, "nodeaddr=%s" % instance_ip)
+            # If the underlying instance is hibernated, set it to DRAIN to prevent additional jobs from being allocated to this node.
+            if instance_attributes["State"]["Name"] == "stopped" and not "DRAIN" in node_states:
+                logger.info("Node %s is linked with a hibernated instance %s. Setting to DRAIN" % (node_name, instance_id))
+                common.update_node(node_name, "state=DRAIN reason=instance_hibernated")
+            elif "DRAIN" in node_states and instance_attributes["State"]["Name"] != "stopped":
+                logger.info("Node %s is linked with a non-hibernated instance %s. Setting to UNDRAIN" % (node_name, instance_id))
+                common.update_node(node_name, "state=UNDRAIN")
+            # Node is stuck.
+            elif "DOWN" in node_states:
+                logger.error("Node %s is stuck and has been set to DOWN. Powering down and resetting..." % (node_name))
+                common.update_node(node_name, "state=POWER_DOWN reason=node_stuck")
+            # In some situations, a node may be placed in COMPLETING+DRAIN state by Slurm 
+            # and remains stuck. In that case, force the node to become DOWN
+            if "COMPLETING" in node_states and ("DRAIN" in node_states or "NOT_RESPONDING" in node_states):
+                common.update_node(node_name, "state=POWER_DOWN_FORCE reason=node_stuck")
+
+    # Are there any instances which are not associated with a node?
+    orphan_instances = {x: y for x, y in instances.items() if x not in seen_instances}
+
+    return nodes_to_create, orphan_instances
+
+
+def terminate_instance(client, instance_id, instance_attributes):
+    """
+    Terminate an EC2 instance and the associated Spot request ID
+    """
+
+    try:
+        client.terminate_instances(InstanceIds=[instance_id])
+        logger.info("Terminated Instance %s" % (instance_id))
+    except Exception as e:
+        logger.error("Failed to terminate Instance %s - %s" %(instance_id, e))
+    
+    # To prevent Spot requests from being re-fulfilled even after their instance is terminated, 
+    # cancel the associated Spot requests.
+    if "SpotInstanceRequestId" in instance_attributes:
+        spot_id = instance_attributes["SpotInstanceRequestId"]
+        try:
+            client.cancel_spot_instance_requests(SpotInstanceRequestIds=[spot_id])
+            logger.info("Cancelled Spot Instance request %s for instance %s" % (spot_id, instance_id))
+        except Exception as e:
+            logger.error("Failed to cancel Spot Instance request %s - %s" %(spot_id, e))
+    time.sleep(0.1)
+
+
+def scontrol_nodeinfo():
+
+    scontrol_output = common.run_scommand("scontrol", ["show", "nodes"])
+    nodeinfo = {}
+    current_node = None
+    for line in scontrol_output:
+
+        if line.startswith("NodeName"):
+            # Node information line
+            # ex. NodeName=xlarge-node-3 CoresPerSocket=64
+            nodename = line.split(" ")[0].split("=")[1]
+            # Check and ensure there are no duplicate nodenames.
+            if nodename in nodeinfo:
+                raise AttributeError("Duplicate nodename detected: %s" % nodename)
+            current_node = nodename
+            nodeinfo[current_node] = {}
+        else:
+            # Information about the current node.
+            line_split = list(i for i in line.split(" ") if "=" in i)
+            attributes = {i.split("=")[0]: i.split("=")[1] for i in line_split}
+            # If the node states are provided (ex. IDLE+CLOUD+POWERED_DOWN), divide those into an
+            # iterable (ex. ["IDLE", "CLOUD", "POWERED_DOWN"])
+            if "State" in attributes:
+                attributes["State"] = attributes["State"].split("+")
+
+            # If a comment is provided (ex. InstanceId: i-21421adf), unpack those arguments into a dictionary.
+            if "Comment" in attributes:
+                comment_split = list(x for x in attributes["Comment"].split(","))
+                attributes["Comment"] = {x.split(":")[0]: x.split(":")[1] for x in comment_split}
+
+            nodeinfo[current_node].update(attributes)
+
+    return nodeinfo
+
+
+def get_all_instances_for_nodegroup(client, launch_template, nodegroup):
+
+    filter_string = [
+        {"Name": "tag:aws:ec2launchtemplate:id", 
+         "Values": [launch_template],
+        },
+        {"Name": "tag:nodegroup",
+         "Values": [nodegroup]
+        },
+        {"Name": "instance-state-name",
+         "Values": ["pending", "running", "stopped", "stopping"]}
+    ]
+
+    instance_ids = {}
+    try:
+        response_describe = client.describe_instances(Filters=filter_string)
+        if len(response_describe["Reservations"]) > 0:
             for reservation in response_describe["Reservations"]:
                 for instance in reservation["Instances"]:
                     instance_id = instance["InstanceId"]
-                    instance_ip = instance['PrivateIpAddress']
-                    instance_name = None
-                    for tag in instance["Tags"]:
-                        if tag["Key"] == "Name":
-                            instance_name = tag["Value"]
-
-                    # If the instance name or type tag is not set, these nodes has not yet been configured
-                    if instance_name is None:
-                        new_instances.append(instance_id)
-                        continue
-
-                    # Is this a Spot instance or On-Demand instance?
-                    if "InstanceLifecycle" in instance and instance["InstanceLifecycle"] == "spot":
-                        spot_instances[instance_name] = instance_id
-                    else:
-                        demand_instances[instance_name] = instance_id
-
-                    # Store the instance ID associated with this node.
-                    if instance_name in nodes:
-                        nodes[instance_name] = instance_id
-
-                        # Check the IP of this, and update if necessary.
-                        node_info = common.run_scommand("scontrol", ["show", "nodes", instance_name])
-                        for line in node_info:
-                            if line.startswith("   NodeAddr="):
-                                node_ip = line.split(" ")[3]
-                                node_ip = node_ip.replace("NodeAddr=", "")
-                                if node_ip != instance_ip:
-                                    logger.info("Node %s has changed IP address from %s to %s. Updating" % (instance_name, node_ip, instance_ip))
-                                    slurm_param = 'nodeaddr=%s nodehostname=%s' %(instance_ip, instance_name)
-                                    common.update_node(instance_name, slurm_param)
-                            # Check to make sure this node is not flagged as POWERED_DOWN. If so, it ran into a race condition where it was re-requested by Slurm at the same time
-                            # it was marked as POWERED_DOWN.
-                            # Mark it as UP to give Slurm the chance to use it again, or power it down.
-                            if line.startswith("   State="):
-                                if "IDLE" in line and "POWERED_DOWN" in line:
-                                    # Mark node as UP to prevent it from becoming an orphan.
-                                    try:
-                                        common.update_node(instance_name, "state=POWER_UP")
-                                        logger.warning("Node %s was set as POWERED_DOWN but is active in the daemon. Setting node to POWER_UP" % instance_name)
-                                    except Exception as e:
-                                        logger.error("Failed to set node %s to POWER_UP - %s" %(instance_name, e))
-
-    return spot_instances, demand_instances, nodes, new_instances
-
-
-def cancel_spot_requests(instance_ids, fleet_id):
-    """
-    Get the spot instance request IDs for a set of EC2 Instance IDs, and cancel the associated requests
-    """
-    try:
-        response_describe = client.describe_instances(InstanceIds=instance_ids)
+                    instance_ids[instance_id] = instance
     except Exception as e:
-        logger.critical('Failed to describe instances - %s' % e)
+        logger.error("Unable to describe instances for launch template %s - %s" % (launch_template, e))
 
-    spot_ids = []
-    if len(response_describe["Reservations"]) == 0:
-        # No instances in fleet.
-        pass
-    else:
-        for reservation in response_describe["Reservations"]:
-            for instance in reservation["Instances"]:
-                if "SpotInstanceRequestId" in instance:
-                    spot_ids.append(instance["SpotInstanceRequestId"])
-
-    # Cancel requests
-    if len(spot_ids) > 0:
-        try:
-            client.cancel_spot_instance_requests(SpotInstanceRequestIds=spot_ids)
-            logger.info('Cancelled Spot Instances Requests %s from fleet %s' % (",".join(spot_ids), fleet_id))
-        except Exception as e:
-            logger.error('Failed to cancel Spot Instances in fleet %s - %s' %(fleet_id, e))
+    return instance_ids
 
 
-# Determine which fleet is associated with which partition.
-partition_fleet_ids = common.parse_fleet_ids()
-partition_regions, partition_type = get_fleet_region_type(partitions)
+# Get a list of all nodes and associated information from Slurm.
+all_node_info = scontrol_nodeinfo()
 
-for partition_name, nodegroups in partition_fleet_ids.items():
-    for nodegroup_name, fleet_id in nodegroups.items():
+for partition_name, nodegroups in config["Partitions"].items():
+ 
+    for nodegroup_name, nodegroup_atts in nodegroups.items():
+
+        region = config["Region"]
 
         # Start AWS client.
-        region = partition_regions[partition_name][nodegroup_name]
-        fleet_type = partition_type[partition_name][nodegroup_name]
         client = boto3.client('ec2', region_name=region)
 
-        # Get the file listing the nodes to run in this partition.
-        nodegroup_folder = config["NodePartitionFolder"]
-        nodegroup_file = nodegroup_folder + os.path.sep + "_".join([partition_name, nodegroup_name, "paritions.txt"])
+        # Get the list of nodes associated with this partition.
+        logger.info("Examining partition: '%s' nodegroup: '%s'" % (partition_name, nodegroup_name))
+        logger.debug("Obtaining Slurm node information for nodegroup")
+        nodegroup_prefix = partition_name + "-" + nodegroup_name
+        nodes = {x: y for x, y in all_node_info.items() if x.startswith(nodegroup_prefix) and y["Partitions"] == partition_name}  # Filter for nodes associated with this partition.
 
-        # Lock this file to prevent other daemon instances from modifying this fleet at the same time.
-        lockfile = nodegroup_file + ".lock"
-        lock = filelock.FileLock(lockfile, timeout = 10)
+        # Get a list of all instances created with the compute node launch template.
+        launch_template = nodegroup_atts["LaunchTemplate"]
+        instances = get_all_instances_for_nodegroup(client, launch_template, nodegroup_prefix)
+        interrupt_behavior = nodegroup_atts["InteruptionBehavior"]
+        logger.debug("Instances currently associated with this nodegroup: %s" % (list(instances.keys())))
 
-        try:
-            with lock:
+        nodes_to_create, orphan_instances = process_fleet_nodes(client, nodes, instances)
 
-                # Load the list of nodes associated with this partition.
-                # This is the "ideal" state of the partition.
-                nodes = {}
-                with open(nodegroup_file) as f:
-                    for line in f:
-                        line = line.rstrip("\r\n")
-                        nodes[line] = None
+        # Do we need to assign instances to nodes which are now powering up?
+        if len(nodes_to_create) > 0:
+            logger.info("Allocating instances for POWERING_UP nodes %s" % ",".join(nodes_to_create))
+            request_new_instances(client, nodes_to_create, nodegroup_atts, nodegroup_prefix)
 
-                num_nodes = len(nodes)
+        # Are there any extraneous instances we should clean up?
+        if len(orphan_instances) > 0:
+            logger.warning("Terminating orphan instances %s " % ",".join(orphan_instances))
+            for instance_id, instance_attr in orphan_instances.items():
+                terminate_instance(client, instance_id, instance_attr)
 
-                # Sanity check that the fleet is healthy.
-                # And determine how many nodes have been allocated to this fleet.
-                logger.info("Examining partition %s" % (partition_name))
-                logger.debug('Found fleet ID %s for partition %s' % (fleet_id, partition_name))
-                try:
-                    fleet_status_response = client.describe_fleets(FleetIds=[fleet_id])
-                    fleet_status = fleet_status_response["Fleets"][0]["FleetState"]
-                    if fleet_status != "active":
-                        logger.error("Fleet %s is not in a healthy state %s" % (fleet_id, fleet_status))
-                        continue
-                except Exception as e:
-                    logger.error('Failed to obtain fleet status for %s: %s' % (fleet_id, e))
-                    continue
-
-                # How many instances are currently running with this fleet?
-                fleet_instances = set(get_fleet_instances(fleet_id))
-                spot_instances, demand_instances, nodes, new_instances = link_nodes_to_fleet(client, fleet_instances, nodes)
-
-                num_instances = len(spot_instances) + len(demand_instances)
-
-                # Find which instances to delete from the current fleet.
-                od_to_remove = list(y for x, y in demand_instances.items() if x not in nodes)
-                spot_to_remove = list(y for x, y in spot_instances.items() if x not in nodes)
-                # Find which new instances need to be allocated.
-                nodes_to_create = list(x for x, y in nodes.items() if y is None)
-
-                # Status messages.
-                logger.info("Partition %s is requesting %s active nodes" % (partition_name, num_nodes))
-                logger.debug("Partition %s active nodes: %s" % (partition_name, ",".join(nodes.keys())))
-                logger.info("Partition %s currently has %s Spot nodes and %s On-Demand nodes in fleet" % (partition_name, len(spot_instances), len(demand_instances)))
-                logger.debug("Partition %s Spot Instances: %s" % (partition_name, ",".join(spot_instances.keys())))
-                logger.debug("Partition %s On-Demand Instances: %s" % (partition_name, ",".join(demand_instances.keys())))
-                logger.debug("Partition %s Instances awaiting configuration: %s" % (partition_name, ",".join(new_instances)))
-                logger.info("Partition %s needs to remove %s instances from fleet, and start %s instances" % (partition_name, len(od_to_remove) + len(spot_to_remove), len(nodes_to_create)))
-
-                # Is this fleet already configured?
-                if len(od_to_remove) == 0 and len(spot_to_remove) == 0 and len(nodes_to_create) == 0 and len(new_instances) == 0:
-                    logger.info("Partition %s already fully provisioned" % partition_name)
-                    continue
-
-                # Expand or shrink fleet size, if necessary
-                adjust_fleet_size(client, fleet_id, num_nodes, len(od_to_remove), fleet_type)
-
-                # Delete extraneous instances.
-                # On-demand instances.
-                if len(od_to_remove) != 0:
-                    try:
-                        client.terminate_instances(InstanceIds=od_to_remove)
-                        logger.info('Terminated on-demand instances %s from fleet %s' % (",".join(od_to_remove), fleet_id))
-                    except Exception as e:
-                        logger.error('Failed to terminate On-Demand instances in fleet %s - %s' %(fleet_id, e))
-                    time.sleep(1)
-                # Spot instances.
-                if len(spot_to_remove):
-                    # Obtain the Spot request IDs for these instances
-                    try:
-                        client.terminate_instances(InstanceIds=spot_to_remove)
-                        logger.info('Terminated Spot Instances %s from fleet %s' % (",".join(spot_to_remove), fleet_id))
-                    except Exception as e:
-                        logger.error('Failed to terminate Spot Instances in fleet %s - %s' %(fleet_id, e))
-                    time.sleep(1)
-                    # To prevent Spot requests from being re-fulfilled even after their instance is terminated, 
-                    # cancel the associated Spot requests.
-                    cancel_spot_requests(spot_to_remove, fleet_id)
-
-                # Allocate new instances.
-                # NOTE: As this daemon only runs once every minute, these new instances were likely started during previous daemon runs.
-                if len(new_instances) > 0:
-                    num_new_instances, orphan_instances = allocate_new_instances(fleet_id, new_instances, nodes_to_create)
-                    
-                    # Clean up any remaining (overprovisioned) instances
-                    for orphan in orphan_instances:
-                        logger.debug("Terminating orphan instance %s" % orphan)
-                        try:
-                            client.terminate_instances(InstanceIds=[orphan])
-                        except Exception as e:
-                            logger.error('Failed to terminate orphan instance in fleet %s - %s' %(fleet_id, e))
-                        # If this is a Spot instance, cancel the associated request.
-                        spot_request_ids = cancel_spot_requests([orphan])
-
-                else:
-                    logger.debug("No new instances currently allocated to fleet %s. Will check again later." % (fleet_id))
-
-                # If this is a spot fleet, check to see if we have reached spot capacity, or if it has taken an excessivly long amount
-                # of time to obtain the necessary spot instances
-                # If this is the case, we will fall back to requesting on-demand instances.
-                if fleet_type == "spot":
-                    if len(nodes_to_create) > 0 and spot_allocation_timeout(client, fleet_id, timeout_seconds=210):
-                        logger.info("Attempting to fill oustanding capacity of fleet %s with On-Demand instances" % (fleet_id))
-                        spot_fallback_to_demand(client, fleet_id, num_nodes)
-
-        except TimeoutError:
-            logger.warning("Failed to process partition %s: Partition is locked" % partition_name)
-
-logger.info("Daemon completed successfully.")
+logger.info("Fleet daemon complete")

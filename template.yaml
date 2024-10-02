@@ -122,15 +122,9 @@ Resources:
             Statement:
               - Effect: Allow
                 Action:
-                  - ec2:CreateFleet
                   - ec2:CancelSpotInstanceRequests
-                  - ec2:DescribeFleets
-                  - ec2:DeleteFleets
-                  - ec2:DescribeFleetInstances
-                  - ec2:DescribeFleetHistory
                   - ec2:RunInstances
                   - ec2:TerminateInstances
-                  - ec2:ModifyFleet
                   - ec2:CreateTags
                   - ec2:DescribeInstances
                   - ec2:DescribeInstanceTypes
@@ -171,9 +165,9 @@ Resources:
             Statement:
               - Effect: Allow
                 Action:
-                  - ec2:DescribeFleets
+                  - ec2:DescribeInstances
                   - ec2:TerminateInstances
-                  - ec2:DeleteFleets
+                  - ec2:CancelSpotInstanceRequests
                   - logs:CreateLogGroup
                   - logs:CreateLogStream
                   - logs:PutLogEvent
@@ -311,137 +305,72 @@ Resources:
 
               cat > $SLURM_HOME/etc/aws/config.json <<EOF
               {
-                 "LogLevel": "DEBUG",
-                 "NodePartitionFolder": "/nfs/slurm/etc/aws/partitions/",
-                 "LogFileName": "/var/log/slurm_plugin.log",
-                 "SlurmBinPath": "$SLURM_HOME/bin",
-                 "SlurmConf": {
-                    "PrivateData": "CLOUD",
-                    "ResumeProgram": "$SLURM_HOME/etc/aws/resume.py",
-                    "SuspendProgram": "$SLURM_HOME/etc/aws/suspend.py",
-                    "ResumeRate": 100,
-                    "SuspendRate": 100,
-                    "ResumeTimeout": 480,
-                    "SuspendTime": 300,
-                    "TreeWidth": 60000,
-                    "GresTypes": "gres"
-                 }
-              }
-              EOF
-
-              cat > $SLURM_HOME/etc/aws/partitions.json <<'EOF'
-              {
-                 "Partitions": [
-                    {
-                       "PartitionName": "compm6i",
-                       "NodeGroups": [
-                          {
-                             "NodeGroupName": "node",
-                             "MaxNodes": 100,
-                             "Region": "${AWS::Region}",
-                             "PurchasingOption": "spot",
-                             "SpotOptions": {
-                                 "AllocationStrategy": "lowest-price",
-                                 "InstanceInterruptionBehavior": "hibernate"
-                             },
-                             "LaunchTemplateSpecification": {
-                                "LaunchTemplateId": "${ComputeNodeLaunchTemplate}",
-                                "Version": "$Latest"
-                             },
-                             "LaunchTemplateOverrides": [
-                                {
-                                   "InstanceType": "m6i.4xlarge",
-                                   "Priority": 1.0
-                                },
-                                {
-                                   "InstanceType": "m7i.4xlarge",
-                                   "Priority": 2.0
-                                }
-                             ],
-                             "SubnetIds": [
-                                "${Subnet1Id}"
-                             ]
+                  "LogLevel": "DEBUG",
+                  "LogFileName": "/var/log/slurm_plugin.log",
+                  "SlurmBinPath": "$SLURM_HOME/bin",
+                  "Region": "${AWS::Region}",
+                  "SlurmConf": {
+                      "PrivateData": "CLOUD",
+                     "ResumeProgram": "$SLURM_HOME/etc/aws/resume.py",
+                     "SuspendProgram": "$SLURM_HOME/etc/aws/suspend.py",
+                     "ResumeRate": 100,
+                     "SuspendRate": 100,
+                     "ResumeTimeout": 300,
+                     "SuspendTime": 300,
+                     "TreeWidth": 60000,
+                     "GresTypes": "gres"
+                  },
+                  "Partitions": {
+                      "compm6i": {
+                          "node": {
+                              "NumNodes": 100,
+                              "PurchasingOption": "spot",
+                              "InteruptionBehavior": "hibernate",
+                              "LaunchTemplate": "${ComputeNodeLaunchTemplate}",
+                              "SubnetIds": [
+                                  "${Subnet1Id}"
+                              ],
+                              "Instances": [
+                                  "m6i.4xlarge",
+                                  "m7i.4xlarge"
+                              ]
                           }
-                       ],
-                       "PartitionOptions": {
-                          "Default": "Yes"
-                       }
-                    }, 
-                    {
-                       "PartitionName": "large",
-                       "NodeGroups": [
-                          {
-                             "NodeGroupName": "node",
-                             "MaxNodes": 100,
-                             "Region": "${AWS::Region}",
-                             "PurchasingOption": "spot",
-                             "SpotOptions": {
-                                 "AllocationStrategy": "lowest-price",
-                                 "InstanceInterruptionBehavior": "hibernate"
-                             },
-                             "LaunchTemplateSpecification": {
-                                "LaunchTemplateId": "${ComputeNodeLaunchTemplate}",
-                                "Version": "$Latest"
-                             },
-                             "LaunchTemplateOverrides": [
-                                {
-                                    "InstanceType": "c5.12xlarge",
-                                    "Priority": 3.0
-                                },
-                                {
-                                    "InstanceType": "c6i.12xlarge",
-                                    "Priority": 1.0
-                                },
-                                {
-                                    "InstanceType": "c7i.12xlarge",
-                                    "Priority": 2.0
-                                },
-                                {
-                                    "InstanceType": "c7a.12xlarge",
-                                    "Priority": 5.0
-                                }
-                             ],
-                             "SubnetIds": [
-                                "${Subnet1Id}"
-                             ]
+                      },
+                      "large": {
+                          "node": {
+                              "NumNodes": 100,
+                              "PurchasingOption": "spot",
+                              "InteruptionBehavior": "hibernate",
+                              "LaunchTemplate": "${ComputeNodeLaunchTemplate}",
+                              "SubnetIds": [
+                                  "${Subnet1Id}"
+                              ],
+                              "Instances": [
+                                  "c6i.12xlarge",
+                                  "c7i.12xlarge",
+                                  "c7a.12xlarge",
+                                  "c5.12xlarge"
+                              ]
                           }
-                       ],
-                       "PartitionOptions": {
-                          "Default": "Yes"
-                       }
-                    },
-                    {
-                       "PartitionName": "xlarge",
-                       "NodeGroups": [
-                          {
-                             "NodeGroupName": "node",
-                             "MaxNodes": 4,
-                             "Region": "${AWS::Region}",
-                             "PurchasingOption": "on-demand",
-                             "SpotOptions": {
-                                 "AllocationStrategy": "lowest-price",
-                                 "InstanceInterruptionBehavior": "terminate"
-                             },
-                             "LaunchTemplateSpecification": {
-                                "LaunchTemplateId": "${ComputeNodeLaunchTemplate}",
-                                "Version": "$Latest"
-                             },
-                             "LaunchTemplateOverrides": [
-                                {
-                                   "InstanceType":  "c6i.32xlarge",
-                                   "Priority": 1.0
-                                }
-                             ],
-                             "SubnetIds": [
-                                "${Subnet1Id}"
-                             ]
+                      },
+                      "xlarge": {
+                          "node": {
+                              "NumNodes": 4,
+                              "PurchasingOption": "on-demand",
+                              "InteruptionBehavior": "terminate",
+                              "LaunchTemplate": "${ComputeNodeLaunchTemplate}",
+                              "SubnetIds": [
+                                  "${Subnet1Id}"
+                              ],
+                              "Instances": [
+                                  "c6i.24xlarge"
+                              ]
                           }
-                       ],
-                       "PartitionOptions": {
-                          "Default": "Yes"
-                       }
-                    }
-                 ]
+                      }
+                  },
+                  "PartitionOptions": {
+                      "compm6i": {}
+                  }
               }
               EOF
 
@@ -487,13 +416,12 @@ Resources:
               # Configure the plugin
               mkdir -p $SLURM_HOME/etc/aws/partitions/
               cd $SLURM_HOME/etc/aws/
-              $SLURM_HOME/etc/aws/generate_conf.py ${AWS::StackId}
+              $SLURM_HOME/etc/aws/generate_conf.py
               cat $SLURM_HOME/etc/aws/slurm.conf.aws >> $SLURM_HOME/etc/slurm.conf
               cp $SLURM_HOME/etc/aws/gres.conf.aws $SLURM_HOME/etc/gres.conf
 
               crontab -l > mycron
               cat > mycron <<EOF
-              * * * * * $SLURM_HOME/etc/aws/change_state.py &>/dev/null
               * * * * * $SLURM_HOME/etc/aws/fleet_daemon.py &>/dev/null
               EOF
               crontab mycron
@@ -578,7 +506,7 @@ Resources:
               cfn-signal -e $? --stack ${AWS::StackName} --resource HeadNodeInstance --region ${AWS::Region}
     CreationPolicy:
       ResourceSignal:
-        Timeout: PT25M
+        Timeout: PT20M
 
   CleanupResources:
     Type: AWS::Lambda::Function
@@ -601,12 +529,27 @@ Resources:
               client = session.client("ec2")
 
               # Get all fleets tagged with this fleet.
-              fleet_filters = [{"Name": "tag:StackID", "Values": ["${AWS::StackId}"]}]
-              describe_resp = client.describe_fleets(Filters=fleet_filters)
+              fleet_filters = [{"Name": "tag:aws:ec2launchtemplate:id", "Values": ["${ComputeNodeLaunchTemplate}"]}]
+              response_describe = client.describe_instances(Filters=fleet_filters)
 
-              for fleet in describe_resp["Fleets"]:
-                fleet_id = fleet["FleetId"]
-                client.delete_fleets(FleetIds=[fleet_id], TerminateInstances=True)
+              if len(response_describe["Reservations"]) > 0:
+                for reservation in response_describe["Reservations"]:
+                  for instance in reservation["Instances"]:
+                    instance_id = instance["InstanceId"]
+
+                    # Terminate the instance (one at a time, so if one instance fails to terminate it doesn't prevent the others)
+                    try:
+                      client.terminate_instance(InstanceIds=[instance_id])
+                    except Exception:
+                      pass
+                    # Terminate the associated spot request (if present)
+                    if "SpotInstanceRequestId" in instance:
+                      spot_id = instance["SpotInstanceRequestId"]
+                      try:
+                        client.cancel_spot_instance_requests(SpotInstanceRequestIds=[spot_id])
+                      except Exception:
+                        pass
+
 
             def handler(event, context):
 

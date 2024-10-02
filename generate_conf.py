@@ -1,20 +1,13 @@
 #!/usr/bin/python3
 
-import copy
-import os
-import json
-import sys
-
+import boto3
 import common
 
 
-logger, config, partitions = common.get_common('generate_conf')
+logger, config = common.get_common('generate_conf')
 
 slurm_filename = 'slurm.conf.aws'
 gres_filename = 'gres.conf.aws'
-
-# We will tag all EC2 fleets with this StackID, to ensure they are cleaned up
-stack_name = sys.argv[1]
 
 # This script generates a file to append to slurm.conf
 with open(slurm_filename, 'w') as f:
@@ -24,66 +17,18 @@ with open(slurm_filename, 'w') as f:
         f.write('%s=%s\n' %(item, value))
     f.write('\n')
 
-    for partition in partitions:
+    for partition_name, nodegroups in config["Partitions"].items():
+
         partition_nodes = ()
-        partition_name = partition['PartitionName']
+        for nodegroup_name, nodegroup_attrs in nodegroups.items():
+            if nodegroup_attrs["NumNodes"] == 0:
+                node_range = "%s-%s-0" % (partition_name, nodegroup_name)
+            else:
+                node_range = "%s-%s-[1-%s]" % (partition_name, nodegroup_name, nodegroup_attrs["NumNodes"])
 
-        for nodegroup in partition['NodeGroups']:
-            nodes = common.get_node_range(partition, nodegroup)
-            partition_nodes += nodes,
-            nodegroup_name = nodegroup["NodeGroupName"]
+            partition_nodes += node_range,
 
-            # Create a file which will contain a list of all nodes slurm is requesting for this partition.
-            nodegroup_folder = config["NodePartitionFolder"]
-            nodegroup_file = nodegroup_folder + os.path.sep + "_".join([partition_name, nodegroup_name, "paritions.txt"])
-            with open(nodegroup_file, "w"):
-                pass
-
-            # Create an EC2 fleet for this partition.
-            # Create the config.
-            request_fleet = {
-                'LaunchTemplateConfigs': [
-                    {
-                        'LaunchTemplateSpecification': nodegroup['LaunchTemplateSpecification'],
-                        'Overrides': []
-                    }
-                ],
-                'TargetCapacitySpecification': {
-                    'TotalTargetCapacity': 0,
-                    'OnDemandTargetCapacity': 0,
-                    'SpotTargetCapacity': 0,
-                    'DefaultTargetCapacityType': nodegroup['PurchasingOption']
-                },
-                'Type': 'maintain',
-                'TagSpecifications': [
-                    {
-                        "ResourceType": "fleet",
-                        "Tags": [
-                            {
-                                "Key": "StackID",
-                                "Value": stack_name
-                            }
-                        ]
-                    }
-                ]
-            }
-
-            # Populate spot options.
-            hibernation_required = False
-            if 'SpotOptions' in nodegroup:
-                request_fleet['SpotOptions'] = nodegroup['SpotOptions']
-                hibernation_required =  request_fleet['SpotOptions']['InstanceInterruptionBehavior'] == 'hibernate'
-
-            if nodegroup["PurchasingOption"] == "on-demand" and hibernation_required:
-                logger.warning("Hibernation cannot be specified for On-Demand fleet. Setting to 'terminate'")
-                request_fleet['SpotOptions']['InstanceInterruptionBehavior'] = 'terminate'
-
-            # Populate on-demand options
-            if 'OnDemandOptions' in nodegroup:
-                request_fleet['OnDemandOptions'] = nodegroup['OnDemandOptions']
-
-            # Create an EC2 fleet.
-            client = common.get_ec2_client(nodegroup)
+            client = client = boto3.client('ec2', region_name=config["Region"])
 
             # Determine the resources in this partition automatically based on selected EC2 instances.
             cpus = []
@@ -91,10 +36,8 @@ with open(slurm_filename, 'w') as f:
             threading = []
             mem_mb = []
 
-            # Populate launch configuration overrides. Duplicate overrides for each subnet.
-            for override in nodegroup['LaunchTemplateOverrides']:
+            for instance_type in nodegroup_attrs["Instances"]:
                 # Parse resources from this instance type.
-                instance_type = override["InstanceType"]
                 try:
                     response_instances = client.describe_instance_types(InstanceTypes=[instance_type])
                 except Exception as e:
@@ -106,6 +49,7 @@ with open(slurm_filename, 'w') as f:
                 instance_threads_cores = response_instances["InstanceTypes"][0]["VCpuInfo"]["DefaultThreadsPerCore"]
                 instance_memory = response_instances["InstanceTypes"][0]["MemoryInfo"]["SizeInMiB"]
                 instance_hibernation = response_instances["InstanceTypes"][0]["HibernationSupported"]
+                hibernation_required = nodegroup_attrs["InteruptionBehavior"] == "hibernate"
 
                 cpus.append(instance_vcpus)
                 cores.append(instance_cores)
@@ -117,27 +61,6 @@ with open(slurm_filename, 'w') as f:
                     logger.error("Instance type %s does not support hibernation, but hibernation is specified for partition %s nodegroup %s" % (instance_type, partition_name, nodegroup_name))
                     continue
 
-                for subnet in nodegroup['SubnetIds']:
-                    override_copy = copy.deepcopy(override)
-                    override_copy['SubnetId'] = subnet
-                    override_copy['WeightedCapacity'] = 1
-                    request_fleet['LaunchTemplateConfigs'][0]['Overrides'].append(override_copy)
-
-            try:
-                logger.debug('EC2 CreateFleet request: %s' %json.dumps(request_fleet, indent=4))
-                response_fleet = client.create_fleet(**request_fleet)
-                logger.debug('EC2 CreateFleet response: %s' %json.dumps(response_fleet, indent=4))
-            except Exception as e:
-                logger.error('Failed to configure fleet for partition=%s and nodegroup=%s - %s' %(partition_name, nodegroup_name, e))
-                continue
-
-            # Get the name of this persistant fleet.
-            fleet_id = response_fleet['FleetId']
-
-            # Write a line for each node group.
-            # Write a comment line with the name of this parition, and the fleet ID.
-            line = '#EC2_FLEET %s %s %s' % (partition_name, nodegroup_name, fleet_id)
-            f.write('%s\n' %line)
             # Write node information.
             # NOTE: To accomidate a diverse set of instances, use the common (minimum) memory and CPUs across the fleet.
             min_cpu = min(cpus)
@@ -145,29 +68,35 @@ with open(slurm_filename, 'w') as f:
             min_threads_cores = threading[cpus.index(min_cpu)]
             min_mem = min(mem_mb)
             nodegroup_specs = "CPUs=%s Boards=1 SocketsPerBoard=1 CoresPerSocket=%s ThreadsPerCore=%s RealMemory=%s" % (min_cpu, min_cores, min_threads_cores, min_mem)
-            line = 'NodeName=%s State=CLOUD %s' %(nodes, nodegroup_specs)
+            line = 'NodeName=%s State=CLOUD %s' %(node_range, nodegroup_specs)
             f.write('%s\n' %line)
+            # Finished processing nodegroup
 
+        # Parse additional partition options (if present)
         part_options = ()
-        if 'PartitionOptions' in partition:
-            for key, value in partition['PartitionOptions'].items():
-                part_options += '%s=%s' %(key, value),
+        if partition_name in config["PartitionOptions"]:
+            for key, value in config["PartitionOptions"][partition_name]:
+                part_options += "%s=%s" % (key, value),
 
         # Write a line for each partition
-        line = 'PartitionName=%s Nodes=%s MaxTime=INFINITE State=UP %s' %(partition_name, ','.join(partition_nodes), ' '.join(part_options))
-        f.write('%s\n\n' %line)
+        line = "PartitionName=%s Nodes=%s MaxTime=INFINITE State=UP %s" %(partition_name, ",".join(partition_nodes), " ".join(part_options))
+        f.write("%s\n\n" %line)
+        # Done processing partition
 
     logger.info('Output slurm.conf file: %s' %slurm_filename)
 
 # This script generates a file to append to gres.conf
 with open(gres_filename, 'w') as g:
-    for partition in partitions:
+    for partition_name, nodegroups in config["Partitions"].items():
 
-        for nodegroup in partition['NodeGroups']:
-            nodes = common.get_node_range(partition, nodegroup)
-            if "SlurmSpecifications" not in nodegroup:
+        for nodegroup_name, nodegroup_attrs in nodegroups.items():
+            if nodegroup_attrs["NumNodes"] == 0:
+                node_range = "%s-%s-0" % (partition_name, nodegroup_name)
+            else:
+                node_range = "%s-%s-[1-%s]" % (partition_name, nodegroup_name, nodegroup_attrs["NumNodes"])
+            if "SlurmSpecifications" not in nodegroup_attrs:
                 continue
-            for key, value in nodegroup['SlurmSpecifications'].items():
+            for key, value in nodegroup_attrs["SlurmSpecifications"].items():
                 if key.upper() == "GRES":
 
                     # Write a line for each node group with Gres
@@ -181,7 +110,7 @@ with open(gres_filename, 'w') as g:
                         typestring="Type=%s" % fields[1]
                         qty=fields[2]
                     else:
-                        assert False, "Invalid GRES field in %" % nodegroup
+                        assert False, "Invalid GRES field in %" % nodegroup_name
 
                     if name.upper() == "GPU":
                         qty=int(qty)
@@ -192,7 +121,7 @@ with open(gres_filename, 'w') as g:
                     else:
                         gresfilestring=""
 
-                    line='NodeName=%s Name=%s %s %s' %(nodes, name, typestring, gresfilestring)
+                    line='NodeName=%s Name=%s %s %s' %(node_range, name, typestring, gresfilestring)
                     g.write('%s\n' %line)
 
     logger.info('Output gres.conf file: %s' %gres_filename)
