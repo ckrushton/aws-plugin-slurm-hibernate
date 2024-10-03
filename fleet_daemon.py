@@ -3,6 +3,7 @@
 # Adapted from https://github.com/aws-samples/aws-plugin-for-slurm
 
 import boto3
+import botocore.config
 import filelock
 import os
 import time
@@ -94,7 +95,7 @@ def request_new_instances(client, node_name, config, nodegroup):
                         break
 
                     # To not flood AWS API with requests.
-                    time.sleep(0.2)
+                    time.sleep(0.1)
 
                 except Exception as e:
                     logger.info("Unable to fullfill spot request for %s instances in subnet %s - %s" % (instance_type, subnet, e))
@@ -124,7 +125,7 @@ def request_new_instances(client, node_name, config, nodegroup):
                         break
 
                     # To not flood AWS API with requests.
-                    time.sleep(0.2)
+                    time.sleep(0.1)
 
                 except Exception as e:
                     logger.info("Unable to fullfill On-Demand request for %s instance in subnet %s - %s" % (instance_type, subnet, e))
@@ -210,11 +211,8 @@ def process_fleet_nodes(client, nodes, instances, spot_requests, config, nodegro
                     # Remove this linked node, as it is terminated.
                     common.update_node(node_name, "Comment=InstanceId:,SpotId:")
             # Instance is UP
-            elif instance_ip != node_attributes["NodeAddr"]:
-                logger.info("Node %s is assigned an IP address of %s, but linked instance %s has an IP address of %s. Updating..." % (node_name, node_attributes["NodeAddr"], instance_id, instance_ip))
-                common.update_node(node_name, "nodeaddr=%s" % instance_ip)
             # If the underlying instance is hibernated, set it to DRAIN to prevent additional jobs from being allocated to this node.
-            if instance_attributes["State"]["Name"] == "stopped" and not "DRAIN" in node_states:
+            elif instance_attributes["State"]["Name"] == "stopped" and not "DRAIN" in node_states:
                 logger.info("Node %s is linked with a hibernated instance %s. Setting to DRAIN" % (node_name, instance_id))
                 common.update_node(node_name, "state=DRAIN reason=instance_hibernated")
             elif "DRAIN" in node_states and instance_attributes["State"]["Name"] != "stopped":
@@ -228,6 +226,9 @@ def process_fleet_nodes(client, nodes, instances, spot_requests, config, nodegro
             # and remains stuck. In that case, force the node to become DOWN
             if "COMPLETING" in node_states and ("DRAIN" in node_states or "NOT_RESPONDING" in node_states):
                 common.update_node(node_name, "state=POWER_DOWN_FORCE reason=node_stuck")
+            if instance_ip != node_attributes["NodeAddr"]:
+                logger.info("Node %s is assigned an IP address of %s, but linked instance %s has an IP address of %s. Updating..." % (node_name, node_attributes["NodeAddr"], instance_id, instance_ip))
+                common.update_node(node_name, "nodeaddr=%s" % instance_ip)
 
     # Are there any instances which are not associated with a node?
     orphan_instances = {x: y for x, y in instances.items() if x not in seen_instances}
@@ -354,41 +355,50 @@ def get_all_instances_for_nodegroup(client, launch_template, nodegroup):
 
 # Get a list of all nodes and associated information from Slurm.
 all_node_info = scontrol_nodeinfo()
+region = config["Region"]
+boto3_config = botocore.config.Config(
+   retries = {"max_attempts": 1,})
+
+client = boto3.client('ec2', region_name=region, config=boto3_config)
 
 for partition_name, nodegroups in config["Partitions"].items():
  
     for nodegroup_name, nodegroup_atts in nodegroups.items():
 
-        region = config["Region"]
-
-        # Start AWS client.
-        client = boto3.client('ec2', region_name=region)
-
-        # Get the list of nodes associated with this partition.
-        logger.info("Examining partition: '%s' nodegroup: '%s'" % (partition_name, nodegroup_name))
-        logger.debug("Obtaining Slurm node information for nodegroup")
+        # Prevent two instances of the daemon from processing the same node group concurrently.
         nodegroup_prefix = partition_name + "-" + nodegroup_name
-        nodes = {x: y for x, y in all_node_info.items() if x.startswith(nodegroup_prefix) and y["Partitions"] == partition_name}  # Filter for nodes associated with this partition.
+        lockfile = "/tmp/slurm-" + nodegroup_prefix + ".lock"
+        lock = filelock.FileLock(lockfile, timeout=10)
+        try:
+            with lock:  # Lock partition while processing.
+                # Start AWS client.
 
-        # Get a list of all instances created with the compute node launch template.
-        launch_template = nodegroup_atts["LaunchTemplate"]
-        instances, spot_requests = get_all_instances_for_nodegroup(client, launch_template, nodegroup_prefix)
-        interrupt_behavior = nodegroup_atts["InteruptionBehavior"]
-        logger.debug("Instances currently associated with this nodegroup: %s" % (list(instances.keys())))
-        logger.debug("Spot requests currently associated with this nodegroup: %s" % (spot_requests))
+                # Get the list of nodes associated with this partition.
+                logger.info("Examining partition: '%s' nodegroup: '%s'" % (partition_name, nodegroup_name))
+                logger.debug("Obtaining Slurm node information for nodegroup")
+                nodes = {x: y for x, y in all_node_info.items() if x.startswith(nodegroup_prefix) and y["Partitions"] == partition_name}  # Filter for nodes associated with this partition.
 
-        orphan_instances, orphan_spot = process_fleet_nodes(client, nodes, instances, spot_requests, nodegroup_atts, nodegroup_prefix)
+                # Get a list of all instances created with the compute node launch template.
+                launch_template = nodegroup_atts["LaunchTemplate"]
+                instances, spot_requests = get_all_instances_for_nodegroup(client, launch_template, nodegroup_prefix)
+                interrupt_behavior = nodegroup_atts["InteruptionBehavior"]
+                logger.debug("Instances currently associated with this nodegroup: %s" % (list(instances.keys())))
+                logger.debug("Spot requests currently associated with this nodegroup: %s" % (spot_requests))
 
-        # Are there any extraneous instances we should clean up?
-        if len(orphan_instances) > 0:
-            logger.warning("Terminating orphan instances %s " % ",".join(orphan_instances.keys()))
-            for instance_id, instance_attr in orphan_instances.items():
-                terminate_instance(client, instance_id, instance_attr)
+                orphan_instances, orphan_spot = process_fleet_nodes(client, nodes, instances, spot_requests, nodegroup_atts, nodegroup_prefix)
 
-        # Are there any orphan spot instances we should clean up?
-        if len(orphan_spot) > 0:
-            logger.warning("Terminating orphan spot requests %s " % ",".join(orphan_spot))
-            for spot_id in orphan_spot:
-                cancel_spot(client, spot_id)
+                # Are there any extraneous instances we should clean up?
+                if len(orphan_instances) > 0:
+                    logger.warning("Terminating orphan instances %s " % ",".join(orphan_instances.keys()))
+                    for instance_id, instance_attr in orphan_instances.items():
+                        terminate_instance(client, instance_id, instance_attr)
+
+                # Are there any orphan spot instances we should clean up?
+                if len(orphan_spot) > 0:
+                    logger.warning("Terminating orphan spot requests %s " % ",".join(orphan_spot))
+                    for spot_id in orphan_spot:
+                        cancel_spot(client, spot_id)
+        except TimeoutError:
+            logger.info("Unable to update process nodegroup \'%s\': Nodegroup locked" % nodegroup_prefix)
 
 logger.info("Fleet daemon complete")
