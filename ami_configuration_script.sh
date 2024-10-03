@@ -4,7 +4,7 @@ set -euo pipefail
 
 # URL to the Slurm tarball.
 SLURM_TAR_URL=https://download.schedmd.com/slurm/slurm-23.02.2.tar.bz2
-PLUGIN_GIT_URL=https://github.com/ckrushton/aws-plugin-slurm-hibernate/raw/hibernate-support/
+PLUGIN_GIT_URL=https://github.com/ckrushton/aws-plugin-slurm-hibernate/raw/hibernate-support-v3/
 
 # Configure ssh on the node.
 cd /home/ubuntu/

@@ -47,41 +47,24 @@ def update_hosts_file(node_name, ip, hostfile="/etc/hosts"):
         logger.warning("Unable to update hostfile %s - %s" % (hostfile, e))
 
 
-def allocate_instance(instance, node_name, weight=1):
-    
-    instance_id = instance["InstanceId"]
-    instance_ip = instance["PrivateIpAddress"]
-    if "SpotInstanceRequestId" in instance:
-        spot_id = instance["SpotInstanceRequestId"]
-    else:
-        spot_id = ""
-    # Assign the appropriate name to this node.
-    try:
-        client.create_tags(Resources = [instance_id], Tags=[{"Key": "Name", "Value": node_name}])
-    except Exception as e:
-        logger.warning("Unable to assign instance %s name %s - %s" % (instance_id, node_name, e))
-    # Allocate this new node to Slurm
-    common.update_node(node_name, "nodeaddr=%s nodehostname=%s comment=InstanceId:%s,SpotId:%s weight=%s" % (instance_ip, node_name, instance_id, spot_id, weight))
-    update_hosts_file(node_name, instance_ip)
-
-
 # Request new EC2 instances and assign to Slurm nodes.
-def request_new_instances(client, new_nodes, config, nodegroup):
+def request_new_instances(client, node_name, config, nodegroup):
 
-    num_new_nodes=len(new_nodes)
-    num_allocated = 0
     launch_template = config["LaunchTemplate"]
     is_spot = config["PurchasingOption"] == "spot"
     interrupt_behavior = config["InteruptionBehavior"]
+    node_allocated = False
 
     tag_specifications = [
         {"ResourceType": "instance",
          "Tags": [{"Key": "nodegroup","Value": nodegroup},
-                  {"Key": "launchtemplate", "Value": launch_template}]
+                  {"Key": "launchtemplate", "Value": launch_template},
+                  {"Key": "Name", "Value": node_name}]
         },
         {"ResourceType": "spot-instances-request",
          "Tags": [{"Key": "nodegroup","Value": nodegroup},
-                  {"Key": "launchtemplate", "Value": launch_template}]
+                  {"Key": "launchtemplate", "Value": launch_template},
+                  {"Key": "Name", "Value": node_name}]
         }
     ]
     market_options = {}
@@ -96,65 +79,69 @@ def request_new_instances(client, new_nodes, config, nodegroup):
         for instance_type in config["Instances"]:
             for subnet in config["SubnetIds"]:
                 try:
-                    num_outstanding_nodes = num_new_nodes - num_allocated
-                    logger.debug("Requesting %s spot instances of type %s in subnet %s" % (num_outstanding_nodes, instance_type, subnet))
-                    instance_response = client.run_instances(LaunchTemplate={"LaunchTemplateId" :launch_template}, InstanceType=instance_type, MinCount=1, MaxCount=num_outstanding_nodes, SubnetId=subnet,
+                    logger.debug("Requesting spot instance of type %s in subnet %s" % (instance_type, subnet))
+                    instance_response = client.run_instances(LaunchTemplate={"LaunchTemplateId" :launch_template}, InstanceType=instance_type, MinCount=1, MaxCount=1, SubnetId=subnet,
                                     InstanceMarketOptions=market_options, TagSpecifications=tag_specifications)
                     logger.debug("Run Instance response - %s" % json.dumps(instance_response,indent=4,default=str))
-                    # Did we manage to allocate nodes?
+                    # Did we manage to allocate an instance?
                     for instance in instance_response["Instances"]:
-                        node_name = new_nodes[num_allocated]
-                        allocate_instance(instance, node_name, weight=2)
-                        num_allocated += 1
+                        instance_id = instance["InstanceId"]
+                        instance_ip = instance["PrivateIpAddress"]
+                        spot_id = instance["SpotInstanceRequestId"]
+                        common.update_node(node_name, "nodeaddr=%s nodehostname=%s comment=InstanceId:%s,SpotId:%s weight=%s" % (instance_ip, node_name, instance_id, spot_id, 2))
+                        update_hosts_file(node_name, instance_ip)
+                        node_allocated = True
+                        break
 
                     # To not flood AWS API with requests.
                     time.sleep(0.2)
 
                 except Exception as e:
-                    logger.info("Unable to fullfill spot request for %s %s instances in subnet %s - %s" % (num_outstanding_nodes, instance_type, subnet, e))
+                    logger.info("Unable to fullfill spot request for %s instances in subnet %s - %s" % (instance_type, subnet, e))
 
-                if num_allocated == num_new_nodes:
+                if node_allocated:
                     break
-            if num_allocated == num_new_nodes:
+            if node_allocated:
                 break
 
     # If this is an on-demand fleet or we can't allocate spot instances, request on-demand instances.
-    if num_allocated < num_new_nodes:
-        tag_specifications.pop(-1)
+    if not node_allocated:
+        tag_specifications.pop(-1)  # Remove the spot instance tagging.
         for instance_type in config["Instances"]:
             for subnet in config["SubnetIds"]:
                 try:
-                    num_outstanding_nodes = num_new_nodes - num_allocated
-                    logger.debug("Requesting %s On-Demand Instances of type %s in subnet %s" % (num_outstanding_nodes, instance_type, subnet))
+                    logger.debug("Requesting On-Demand Instance of type %s in subnet %s" % (instance_type, subnet))
                     instance_response = client.run_instances(LaunchTemplate={"LaunchTemplateId" :launch_template}, InstanceType=instance_type, MinCount=1, 
-                                                             MaxCount=num_outstanding_nodes, SubnetId=subnet, TagSpecifications=tag_specifications)
+                                                             MaxCount=1, SubnetId=subnet, TagSpecifications=tag_specifications)
                     logger.debug("Run Instance response - %s" % json.dumps(instance_response,indent=4,default=str))
                     # Did we manage to allocate nodes?
                     for instance in instance_response["Instances"]:
-                        node_name = new_nodes[num_allocated]
-                        allocate_instance(instance, node_name, weight=1)
-                        num_allocated += 1
+                        instance_id = instance["InstanceId"]
+                        instance_ip = instance["PrivateIpAddress"]
+                        common.update_node(node_name, "nodeaddr=%s nodehostname=%s comment=InstanceId:%s,SpotId:%s weight=%s" % (instance_ip, node_name, instance_id, "", 1))
+                        update_hosts_file(node_name, instance_ip)
+                        node_allocated = True
+                        break
 
                     # To not flood AWS API with requests.
                     time.sleep(0.2)
 
                 except Exception as e:
-                    logger.info("Unable to fullfill On-Demand request for %s %s instances in subnet %s - %s" % (num_outstanding_nodes, instance_type, subnet, e))
+                    logger.info("Unable to fullfill On-Demand request for %s instance in subnet %s - %s" % (instance_type, subnet, e))
 
-                if num_allocated == num_new_nodes:
+                if node_allocated:
                     break
-            if num_allocated == num_new_nodes:
+            if node_allocated:
                 break
 
-    if num_allocated < num_new_nodes:
+    if not node_allocated:
         # If we can't allocate enough instances right now, that is okay, we will try again the next time the daemon is run.
-        logger.warning("Unable launch %s instances" % num_outstanding_nodes)
+        logger.warning("Unable launch instance for node %s. Will try again later" % node_name)
 
 
 # Compare the nodes that are currently running to those present in the fleet, and determine what changes are required.
-def process_fleet_nodes(client, nodes, instances, spot_requests):
+def process_fleet_nodes(client, nodes, instances, spot_requests, config, nodegroup):
 
-    nodes_to_create = []
     seen_instances = []
     seen_spot = []
 
@@ -199,7 +186,8 @@ def process_fleet_nodes(client, nodes, instances, spot_requests):
             # No instance is allocated to this node.
             if "POWERING_UP" in node_states:
                 # We need to allocate an instance to this node.
-                nodes_to_create.append(node_name)
+                logger.info("Node %s is POWERING_UP. Allocating instance" % node_name)
+                request_new_instances(client, node_name, config, nodegroup)
             elif "POWERED_DOWN" in node_states or "POWERING_DOWN" in node_states:
                 # Node is powered down, and no instance is linked. This is the appropriate senario.
                 # Ensure the node is not tagged with an instance.
@@ -245,7 +233,7 @@ def process_fleet_nodes(client, nodes, instances, spot_requests):
     orphan_instances = {x: y for x, y in instances.items() if x not in seen_instances}
     orphan_spot = list(x for x in spot_requests if x not in seen_spot)
 
-    return nodes_to_create, orphan_instances, orphan_spot
+    return orphan_instances, orphan_spot
 
 
 def terminate_instance(client, instance_id, instance_attributes):
@@ -389,12 +377,7 @@ for partition_name, nodegroups in config["Partitions"].items():
         logger.debug("Instances currently associated with this nodegroup: %s" % (list(instances.keys())))
         logger.debug("Spot requests currently associated with this nodegroup: %s" % (spot_requests))
 
-        nodes_to_create, orphan_instances, orphan_spot = process_fleet_nodes(client, nodes, instances, spot_requests)
-
-        # Do we need to assign instances to nodes which are now powering up?
-        if len(nodes_to_create) > 0:
-            logger.info("Allocating instances for POWERING_UP nodes %s" % ",".join(nodes_to_create))
-            request_new_instances(client, nodes_to_create, nodegroup_atts, nodegroup_prefix)
+        orphan_instances, orphan_spot = process_fleet_nodes(client, nodes, instances, spot_requests, nodegroup_atts, nodegroup_prefix)
 
         # Are there any extraneous instances we should clean up?
         if len(orphan_instances) > 0:
