@@ -123,6 +123,7 @@ Resources:
               - Effect: Allow
                 Action:
                   - ec2:CancelSpotInstanceRequests
+                  - ec2:DescribeSpotInstanceRequests
                   - ec2:RunInstances
                   - ec2:TerminateInstances
                   - ec2:CreateTags

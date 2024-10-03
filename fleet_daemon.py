@@ -51,13 +51,17 @@ def allocate_instance(instance, node_name, weight=1):
     
     instance_id = instance["InstanceId"]
     instance_ip = instance["PrivateIpAddress"]
+    if "SpotInstanceRequestId" in instance:
+        spot_id = instance["SpotInstanceRequestId"]
+    else:
+        spot_id = ""
     # Assign the appropriate name to this node.
     try:
         client.create_tags(Resources = [instance_id], Tags=[{"Key": "Name", "Value": node_name}])
     except Exception as e:
         logger.warning("Unable to assign instance %s name %s - %s" % (instance_id, node_name, e))
     # Allocate this new node to Slurm
-    common.update_node(node_name, "nodeaddr=%s nodehostname=%s comment=InstanceId:%s weight=%s" % (instance_ip, node_name, instance_id, weight))
+    common.update_node(node_name, "nodeaddr=%s nodehostname=%s comment=InstanceId:%s,SpotId:%s weight=%s" % (instance_ip, node_name, instance_id, spot_id, weight))
     update_hosts_file(node_name, instance_ip)
 
 
@@ -72,11 +76,12 @@ def request_new_instances(client, new_nodes, config, nodegroup):
 
     tag_specifications = [
         {"ResourceType": "instance",
-         "Tags": [
-                {"Key": "nodegroup",
-                 "Value": nodegroup
-                 }
-            ]
+         "Tags": [{"Key": "nodegroup","Value": nodegroup},
+                  {"Key": "launchtemplate", "Value": launch_template}]
+        },
+        {"ResourceType": "spot-instances-request",
+         "Tags": [{"Key": "nodegroup","Value": nodegroup},
+                  {"Key": "launchtemplate", "Value": launch_template}]
         }
     ]
     market_options = {}
@@ -87,7 +92,6 @@ def request_new_instances(client, new_nodes, config, nodegroup):
                               "InstanceInterruptionBehavior": interrupt_behavior
                           }
                           }
-
         # Try to allocate spot instances first.
         for instance_type in config["Instances"]:
             for subnet in config["SubnetIds"]:
@@ -116,6 +120,7 @@ def request_new_instances(client, new_nodes, config, nodegroup):
 
     # If this is an on-demand fleet or we can't allocate spot instances, request on-demand instances.
     if num_allocated < num_new_nodes:
+        tag_specifications.pop(-1)
         for instance_type in config["Instances"]:
             for subnet in config["SubnetIds"]:
                 try:
@@ -147,10 +152,11 @@ def request_new_instances(client, new_nodes, config, nodegroup):
 
 
 # Compare the nodes that are currently running to those present in the fleet, and determine what changes are required.
-def process_fleet_nodes(client, nodes, instances):
+def process_fleet_nodes(client, nodes, instances, spot_requests):
 
     nodes_to_create = []
     seen_instances = []
+    seen_spot = []
 
     # Process all nodes in this partition and nodegroup.
     for node_name, node_attributes in nodes.items():
@@ -158,13 +164,18 @@ def process_fleet_nodes(client, nodes, instances):
         logger.info("Processing node %s" % node_name)
         
         instance_id = None
+        instance_id_raw = ""
         instance_attributes = {}
 
         if "Comment" in node_attributes:
-            instance_id = node_attributes["Comment"]["InstanceId"]
-            if instance_id == "":
-                instance_id = None
+            instance_id_raw = node_attributes["Comment"]["InstanceId"]
+            if "SpotId" in node_attributes["Comment"]:
+                spot_id = node_attributes["Comment"]["SpotId"]
             else:
+                spot_id = ""
+            seen_spot.append(spot_id)
+            if instance_id_raw != "":
+                instance_id = instance_id_raw
                 logger.info("Node %s is linked to instance %s" % (node_name, instance_id))
                 try:
                     instance_attributes = instances[instance_id]
@@ -180,6 +191,9 @@ def process_fleet_nodes(client, nodes, instances):
         if "DOWN" in node_states and "POWERED_DOWN" in node_states:
             logger.info("Node %s is POWERED_DOWN because it went DOWN. Resetting..." % node_name)
             common.update_node(node_name, "state=IDLE")
+        elif "DRAIN" in node_states and "POWERED_DOWN" in node_states:
+            logger.info("Node %s is DRAINing but POWERED_DOWN. Resetting..." % node_name)
+            common.update_node(node_name, "state=IDLE")
 
         elif instance_id is None:
             # No instance is allocated to this node.
@@ -188,7 +202,9 @@ def process_fleet_nodes(client, nodes, instances):
                 nodes_to_create.append(node_name)
             elif "POWERED_DOWN" in node_states or "POWERING_DOWN" in node_states:
                 # Node is powered down, and no instance is linked. This is the appropriate senario.
-                pass
+                # Ensure the node is not tagged with an instance.
+                if instance_id_raw != "" and instance_id is None:
+                    common.update_node(node_name, "Comment=InstanceId:,SpotId:")
             else:
                 # Node is up, but there is no associated instance (was it terminated outside of Slurm's control?)
                 # Set this node to DOWN.
@@ -204,7 +220,7 @@ def process_fleet_nodes(client, nodes, instances):
                     logger.info("Node %s is set to POWER_DOWN. Terminating linked instance %s" % (node_name, instance_id))
                     terminate_instance(client, instance_id, instance_attributes)
                     # Remove this linked node, as it is terminated.
-                    common.update_node(node_name, "Comment=InstanceId:")
+                    common.update_node(node_name, "Comment=InstanceId:,SpotId:")
             # Instance is UP
             elif instance_ip != node_attributes["NodeAddr"]:
                 logger.info("Node %s is assigned an IP address of %s, but linked instance %s has an IP address of %s. Updating..." % (node_name, node_attributes["NodeAddr"], instance_id, instance_ip))
@@ -227,20 +243,21 @@ def process_fleet_nodes(client, nodes, instances):
 
     # Are there any instances which are not associated with a node?
     orphan_instances = {x: y for x, y in instances.items() if x not in seen_instances}
+    orphan_spot = list(x for x in spot_requests if x not in seen_spot)
 
-    return nodes_to_create, orphan_instances
+    return nodes_to_create, orphan_instances, orphan_spot
 
 
 def terminate_instance(client, instance_id, instance_attributes):
     """
     Terminate an EC2 instance and the associated Spot request ID
     """
-
-    try:
-        client.terminate_instances(InstanceIds=[instance_id])
-        logger.info("Terminated Instance %s" % (instance_id))
-    except Exception as e:
-        logger.error("Failed to terminate Instance %s - %s" %(instance_id, e))
+    if instance_id is not None:
+        try:
+            client.terminate_instances(InstanceIds=[instance_id])
+            logger.info("Terminated Instance %s" % (instance_id))
+        except Exception as e:
+            logger.error("Failed to terminate Instance %s - %s" %(instance_id, e))
     
     # To prevent Spot requests from being re-fulfilled even after their instance is terminated, 
     # cancel the associated Spot requests.
@@ -252,6 +269,24 @@ def terminate_instance(client, instance_id, instance_attributes):
         except Exception as e:
             logger.error("Failed to cancel Spot Instance request %s - %s" %(spot_id, e))
     time.sleep(0.1)
+
+
+def cancel_spot(client, spot_id):
+    """
+    Cancels a spot instance request and terminates the associated EC2 instance(if present)
+    """
+
+    instance_id = None
+
+    try:
+        response_describe = client.describe_spot_instance_requests(SpotInstanceRequestIds=[spot_id])
+        for request in response_describe["SpotInstanceRequests"]:  # Should have a length of 1
+            if "InstanceId" in request:
+                instance_id = request["InstanceId"]
+    except Exception as e:
+        logger.error("Unable to describe spot request  %s - %s" % (spot_id, e))
+
+    terminate_instance(client, instance_id, {"SpotInstanceRequestId": spot_id})
 
 
 def scontrol_nodeinfo():
@@ -292,7 +327,7 @@ def scontrol_nodeinfo():
 def get_all_instances_for_nodegroup(client, launch_template, nodegroup):
 
     filter_string = [
-        {"Name": "tag:aws:ec2launchtemplate:id", 
+        {"Name": "tag:launchtemplate", 
          "Values": [launch_template],
         },
         {"Name": "tag:nodegroup",
@@ -302,6 +337,7 @@ def get_all_instances_for_nodegroup(client, launch_template, nodegroup):
          "Values": ["pending", "running", "stopped", "stopping"]}
     ]
 
+    # Get a list of EC2 instances using this launch template, and tagged with this nodegroup
     instance_ids = {}
     try:
         response_describe = client.describe_instances(Filters=filter_string)
@@ -313,7 +349,19 @@ def get_all_instances_for_nodegroup(client, launch_template, nodegroup):
     except Exception as e:
         logger.error("Unable to describe instances for launch template %s - %s" % (launch_template, e))
 
-    return instance_ids
+    # Get a list of spot requests tagged with this nodegroup.
+    filter_string.pop(-1)
+    filter_string.append({"Name": "state", "Values": ["open", "active"]})
+    spot_ids = []
+    try:
+        response_describe = client.describe_spot_instance_requests(Filters=filter_string)
+        for request in response_describe["SpotInstanceRequests"]:
+            spot_id = request["SpotInstanceRequestId"]
+            spot_ids.append(spot_id)
+    except Exception as e:
+        logger.error("Unable to describe spot requests for launch template %s - %s" % (launch_template, e))
+
+    return instance_ids, spot_ids
 
 
 # Get a list of all nodes and associated information from Slurm.
@@ -336,11 +384,12 @@ for partition_name, nodegroups in config["Partitions"].items():
 
         # Get a list of all instances created with the compute node launch template.
         launch_template = nodegroup_atts["LaunchTemplate"]
-        instances = get_all_instances_for_nodegroup(client, launch_template, nodegroup_prefix)
+        instances, spot_requests = get_all_instances_for_nodegroup(client, launch_template, nodegroup_prefix)
         interrupt_behavior = nodegroup_atts["InteruptionBehavior"]
         logger.debug("Instances currently associated with this nodegroup: %s" % (list(instances.keys())))
+        logger.debug("Spot requests currently associated with this nodegroup: %s" % (spot_requests))
 
-        nodes_to_create, orphan_instances = process_fleet_nodes(client, nodes, instances)
+        nodes_to_create, orphan_instances, orphan_spot = process_fleet_nodes(client, nodes, instances, spot_requests)
 
         # Do we need to assign instances to nodes which are now powering up?
         if len(nodes_to_create) > 0:
@@ -349,8 +398,14 @@ for partition_name, nodegroups in config["Partitions"].items():
 
         # Are there any extraneous instances we should clean up?
         if len(orphan_instances) > 0:
-            logger.warning("Terminating orphan instances %s " % ",".join(orphan_instances))
+            logger.warning("Terminating orphan instances %s " % ",".join(orphan_instances.keys()))
             for instance_id, instance_attr in orphan_instances.items():
                 terminate_instance(client, instance_id, instance_attr)
+
+        # Are there any orphan spot instances we should clean up?
+        if len(orphan_spot) > 0:
+            logger.warning("Terminating orphan spot requests %s " % ",".join(orphan_spot))
+            for spot_id in orphan_spot:
+                cancel_spot(client, spot_id)
 
 logger.info("Fleet daemon complete")
