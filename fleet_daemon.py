@@ -8,6 +8,7 @@ import filelock
 import os
 import time
 import json
+import urllib.request
 
 import common
 
@@ -49,7 +50,7 @@ def update_hosts_file(node_name, ip, hostfile="/etc/hosts"):
 
 
 # Request new EC2 instances and assign to Slurm nodes.
-def request_new_instances(client, node_name, config, nodegroup):
+def request_new_instances(client, node_name, config, instance_rank, nodegroup):
 
     launch_template = config["LaunchTemplate"]
     is_spot = config["PurchasingOption"] == "spot"
@@ -77,7 +78,7 @@ def request_new_instances(client, node_name, config, nodegroup):
                           }
                           }
         # Try to allocate spot instances first.
-        for instance_type in config["Instances"]:
+        for instance_type in instance_rank:
             for subnet in config["SubnetIds"]:
                 try:
                     logger.debug("Requesting spot instance of type %s in subnet %s" % (instance_type, subnet))
@@ -141,7 +142,7 @@ def request_new_instances(client, node_name, config, nodegroup):
 
 
 # Compare the nodes that are currently running to those present in the fleet, and determine what changes are required.
-def process_fleet_nodes(client, nodes, instances, spot_requests, config, nodegroup):
+def process_fleet_nodes(client, nodes, instances, instance_rank, spot_requests, config, nodegroup):
 
     seen_instances = []
     seen_spot = []
@@ -188,7 +189,7 @@ def process_fleet_nodes(client, nodes, instances, spot_requests, config, nodegro
             if "POWERING_UP" in node_states:
                 # We need to allocate an instance to this node.
                 logger.info("Node %s is POWERING_UP. Allocating instance" % node_name)
-                request_new_instances(client, node_name, config, nodegroup)
+                request_new_instances(client, node_name, config, instance_rank, nodegroup)
             elif "POWERED_DOWN" in node_states or "POWERING_DOWN" in node_states:
                 # Node is powered down, and no instance is linked. This is the appropriate senario.
                 # Ensure the node is not tagged with an instance.
@@ -353,12 +354,84 @@ def get_all_instances_for_nodegroup(client, launch_template, nodegroup):
     return instance_ids, spot_ids
 
 
+def get_spot_interruption_rate(region, instance_type, interrupt_url = "https://spot-bid-advisor.s3.amazonaws.com/spot-advisor-data.json"):
+    """
+    Determine the liklihood of a Spot interruption for a given instance.
+    """
+
+    # Load spot interruption frequency file from AWS.
+    with urllib.request.urlopen(interrupt_url) as f:
+        interrupt_json = json.load(f)
+
+    if region not in interrupt_json["spot_advisor"]:
+        logger.warning("Unable to obtain Spot Instance interruption likelihood for region %s" % region)
+        return 10  # Return a super high ranking, so this is prioritized last.
+    
+    region_instances = interrupt_json["spot_advisor"][region]["Linux"]
+    if instance_type not in region_instances:
+        logger.warning("Unable to obtain Spot Instance interruption likelihood for instance type %s in region %s" % (instance_type, region))
+        return 10  # Return a super high ranking, so this is prioritized last.
+    
+    interrupt_ranking = region_instances[instance_type]["r"]  # Lower is better (i.e. less likely to be interrupted)
+    return interrupt_ranking
+
+def get_spot_pricing(region, instance_type, pricing_url = "http://spot-price.s3.amazonaws.com/spot.js"):
+    """
+    Get the spot pricing for a given instance type.
+    """
+    # Load spot interruption frequency file from AWS.
+    with urllib.request.urlopen(pricing_url) as f:
+        pricing_dump = f.read().decode("utf-8")
+        json_data = pricing_dump[pricing_dump.find('{'): pricing_dump.rfind('}')+1]
+        pricing_json = json.loads(json_data)
+
+    for region_data in pricing_json["config"]["regions"]:
+        if region_data["region"] == region:  # We have found the correct region.
+            # Find matching instance type.
+            for instance_group_data in region_data["instanceTypes"]:
+                for instance_data in instance_group_data["sizes"]:
+                    if instance_data["size"] == instance_type:  # We have found the correct price.
+                        value_data = instance_data["valueColumns"][0]  # Info for Linux is stored in column 1
+                        price = value_data["prices"]["USD"]
+                        if price == "N/A*":  # No pricing data availible.
+                            return None
+                        else:
+                            return float(price)
+            else:  # We did not find pricing data for this instance type.
+                logger.warning("Unable to obtain Stop Instance pricing for instance type %s in region %s" % (instance_type, region))
+                return None
+    else:  # We did not find pricing data for this region
+        logger.warning("Unable to obtain Stop Instance pricing for region %s" % region)
+        return None
+
+
+def get_instance_priority(instances, allocation_strategy, purchasing_option):
+
+    if allocation_strategy == "rank" or purchasing_option == "on-demand":
+        # Use the provided user order.
+        logger.info("Using user-provided instance order to assign instance priority")
+        instance_rank = instances
+    elif allocation_strategy == "lowest-price":
+        # Prioritize lowest cost instances.
+        logger.info("Prioritizing lowest cost Spot Instances")
+        instance_rank = sorted(instances, key=lambda x: get_spot_pricing(region, x))
+    elif allocation_strategy == "capacity-optimized":
+        logger.info("Prioritizing Spot Instances with the lowest likelihood of interruption")
+        instance_rank = sorted(instances, key=lambda x: get_spot_interruption_rate(region, x))
+    elif allocation_strategy == "price-capacity-optimized":
+        logger.info("Prioritizing Spot Instances using a mix of instance pricing and capacity")
+        instance_rank = sorted(instances, key=lambda x: (get_spot_interruption_rate(region, x) + 3) * get_spot_pricing(region, x))
+
+    return instance_rank
+
+
 # Get a list of all nodes and associated information from Slurm.
 all_node_info = scontrol_nodeinfo()
 region = config["Region"]
 boto3_config = botocore.config.Config(
    retries = {"max_attempts": 1,})
 
+# Start AWS client.
 client = boto3.client('ec2', region_name=region, config=boto3_config)
 
 for partition_name, nodegroups in config["Partitions"].items():
@@ -371,12 +444,14 @@ for partition_name, nodegroups in config["Partitions"].items():
         lock = filelock.FileLock(lockfile, timeout=10)
         try:
             with lock:  # Lock partition while processing.
-                # Start AWS client.
 
                 # Get the list of nodes associated with this partition.
                 logger.info("Examining partition: '%s' nodegroup: '%s'" % (partition_name, nodegroup_name))
                 logger.debug("Obtaining Slurm node information for nodegroup")
                 nodes = {x: y for x, y in all_node_info.items() if x.startswith(nodegroup_prefix) and y["Partitions"] == partition_name}  # Filter for nodes associated with this partition.
+
+                instance_rank = get_instance_priority(nodegroup_atts["Instances"], nodegroup_atts["AllocationStrategy"], nodegroup_atts["PurchasingOption"])
+                logger.debug("Instance priority for nodegroup %s: %s" % (nodegroup_prefix, " > ".join(instance_rank)))
 
                 # Get a list of all instances created with the compute node launch template.
                 launch_template = nodegroup_atts["LaunchTemplate"]
@@ -385,7 +460,7 @@ for partition_name, nodegroups in config["Partitions"].items():
                 logger.debug("Instances currently associated with this nodegroup: %s" % (list(instances.keys())))
                 logger.debug("Spot requests currently associated with this nodegroup: %s" % (spot_requests))
 
-                orphan_instances, orphan_spot = process_fleet_nodes(client, nodes, instances, spot_requests, nodegroup_atts, nodegroup_prefix)
+                orphan_instances, orphan_spot = process_fleet_nodes(client, nodes, instances, instance_rank, spot_requests, nodegroup_atts, nodegroup_prefix)
 
                 # Are there any extraneous instances we should clean up?
                 if len(orphan_instances) > 0:

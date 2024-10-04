@@ -124,6 +124,8 @@ Resources:
                 Action:
                   - ec2:CancelSpotInstanceRequests
                   - ec2:DescribeSpotInstanceRequests
+                  - ec2:CreateTags
+                  - ec2:DeleteTags
                   - ec2:RunInstances
                   - ec2:TerminateInstances
                   - ec2:DescribeInstances
@@ -324,6 +326,7 @@ Resources:
                           "node": {
                               "NumNodes": 100,
                               "PurchasingOption": "spot",
+                              "AllocationStrategy": "price-capacity-optimized",
                               "InteruptionBehavior": "hibernate",
                               "LaunchTemplate": "${ComputeNodeLaunchTemplate}",
                               "SubnetIds": [
@@ -339,6 +342,7 @@ Resources:
                           "node": {
                               "NumNodes": 100,
                               "PurchasingOption": "spot",
+                              "AllocationStrategy": "price-capacity-optimized",
                               "InteruptionBehavior": "hibernate",
                               "LaunchTemplate": "${ComputeNodeLaunchTemplate}",
                               "SubnetIds": [
@@ -356,6 +360,7 @@ Resources:
                           "node": {
                               "NumNodes": 4,
                               "PurchasingOption": "on-demand",
+                              "AllocationStrategy": "lowest-price",
                               "InteruptionBehavior": "terminate",
                               "LaunchTemplate": "${ComputeNodeLaunchTemplate}",
                               "SubnetIds": [

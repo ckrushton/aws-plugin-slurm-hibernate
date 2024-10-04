@@ -65,6 +65,9 @@ def validate_config(config):
             
             assert "PurchasingOption" in nodegroup_attributes
             assert nodegroup_attributes["PurchasingOption"] in ("spot", "on-demand")
+
+            assert "AllocationStrategy" in nodegroup_attributes
+            assert nodegroup_attributes["AllocationStrategy"] in ("rank", "lowest-price", "capacity-optimized", "price-capacity-optimized")
             
             assert "InteruptionBehavior" in nodegroup_attributes
             assert nodegroup_attributes["InteruptionBehavior"] in ("stop", "terminate", "hibernate")
