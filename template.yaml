@@ -122,14 +122,21 @@ Resources:
             Statement:
               - Effect: Allow
                 Action:
+                  - ec2:AttachVolume
                   - ec2:CancelSpotInstanceRequests
-                  - ec2:DescribeSpotInstanceRequests
                   - ec2:CreateTags
                   - ec2:DeleteTags
-                  - ec2:RunInstances
-                  - ec2:TerminateInstances
+                  - ec2:DeleteVolume
+                  - ec2:DescribeLaunchTemplateVersions
                   - ec2:DescribeInstances
+                  - ec2:DescribeInstanceStatus
                   - ec2:DescribeInstanceTypes
+                  - ec2:DescribeSpotInstanceRequests
+                  - ec2:DetatchVolume
+                  - ec2:ModifyNetworkInterfaceAttribute
+                  - ec2:RunInstances
+                  - ec2:StopInstances
+                  - ec2:TerminateInstances
                   - iam:CreateServiceLinkedRole
                   - s3:GetObject
                   - s3:GetObjectAttributes
@@ -328,6 +335,7 @@ Resources:
                               "PurchasingOption": "spot",
                               "AllocationStrategy": "price-capacity-optimized",
                               "InteruptionBehavior": "hibernate",
+                              "MaxHibernationMin": 45,
                               "LaunchTemplate": "${ComputeNodeLaunchTemplate}",
                               "SubnetIds": [
                                   "${Subnet1Id}"
@@ -344,6 +352,7 @@ Resources:
                               "PurchasingOption": "spot",
                               "AllocationStrategy": "price-capacity-optimized",
                               "InteruptionBehavior": "hibernate",
+                              "MaxHibernationMin": 45,
                               "LaunchTemplate": "${ComputeNodeLaunchTemplate}",
                               "SubnetIds": [
                                   "${Subnet1Id}"
@@ -526,15 +535,16 @@ Resources:
             import cfnresponse
             import os
 
+
             def delete():
-              # Delete all EC2 fleets assocaited with this Stack.
+              # Delete all EC2 instances associated with this Stack.
               region = os.environ["AWS_REGION"]
               session = boto3.session.Session(region_name=region)
               client = session.client("ec2")
 
-              # Get all fleets tagged with this fleet.
-              fleet_filters = [{"Name": "tag:aws:ec2launchtemplate:id", "Values": ["${ComputeNodeLaunchTemplate}"]}]
-              response_describe = client.describe_instances(Filters=fleet_filters)
+              # Get all instances tagged with this fleet.
+              instance_filters = [{"Name": "tag:launchtemplate", "Values": ["${ComputeNodeLaunchTemplate}"]}]
+              response_describe = client.describe_instances(Filters=instance_filters)
 
               if len(response_describe["Reservations"]) > 0:
                 for reservation in response_describe["Reservations"]:
@@ -554,13 +564,23 @@ Resources:
                       except Exception:
                         pass
 
+              # Get all spot requests associated with this Stack.
+              instance_filters.append({"Name": "state", "Values": ["open", "active"]})
+              response_describe = client.describe_spot_instance_requests(Filters=instance_filters)
+              # Cancel the open spot requests
+              for request in response_describe["SpotInstanceRequests"]:
+                try:
+                  client.cancel_spot_instance_requests(SpotInstanceRequestIds=request["SpotInstanceRequestId"])
+                except Exception:
+                  pass
+
 
             def handler(event, context):
 
               response = {}
               if event["RequestType"] == "Delete":
                 delete()
-                response["output"] = "EC2 fleets deleted"
+                response["output"] = "Instances terminated"
               cfnresponse.send(event, context, cfnresponse.SUCCESS, response)
 
       FunctionName:
@@ -575,7 +595,7 @@ Resources:
       Handler: index.handler
       MemorySize: 128
       Runtime: python3.9
-      Timeout: 60
+      Timeout: 120
 
   OnStackDeletion:
     Type: AWS::CloudFormation::CustomResource

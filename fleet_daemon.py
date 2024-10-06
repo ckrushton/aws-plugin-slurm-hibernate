@@ -4,6 +4,7 @@
 
 import boto3
 import botocore.config
+import datetime
 import filelock
 import os
 import time
@@ -55,7 +56,10 @@ def request_new_instances(client, node_name, config, instance_rank, nodegroup):
     launch_template = config["LaunchTemplate"]
     is_spot = config["PurchasingOption"] == "spot"
     interrupt_behavior = config["InteruptionBehavior"]
-    overrides = config["Overrides"]
+    try:
+        overrides = config["Overrides"]
+    except KeyError:  # No overrides specified
+        overrides = {}
     node_allocated = False
 
     tag_specifications = [
@@ -146,6 +150,7 @@ def request_new_instances(client, node_name, config, instance_rank, nodegroup):
 # Compare the nodes that are currently running to those present in the fleet, and determine what changes are required.
 def process_fleet_nodes(client, nodes, instances, instance_rank, spot_requests, config, nodegroup):
 
+    instances_to_transplant = {}
     seen_instances = []
     seen_spot = []
 
@@ -176,6 +181,9 @@ def process_fleet_nodes(client, nodes, instances, instance_rank, spot_requests, 
                     instance_id = None
 
         node_states = set(node_attributes["State"])
+
+        if node_attributes["Weight"] == 0:
+            logger.info("Node %s has its Weight set to 0 and is thus locked. Skipping..." % node_name)
 
         # If this node has been powered down because it went down, reset it and set it to idle.
         # Let the node fully power down first so we don't overwhelm Slurm.
@@ -215,9 +223,19 @@ def process_fleet_nodes(client, nodes, instances, instance_rank, spot_requests, 
                     common.update_node(node_name, "Comment=InstanceId:,SpotId:")
             # Instance is UP
             # If the underlying instance is hibernated, set it to DRAIN to prevent additional jobs from being allocated to this node.
-            elif instance_attributes["State"]["Name"] == "stopped" and not "DRAIN" in node_states:
-                logger.info("Node %s is linked with a hibernated instance %s. Setting to DRAIN" % (node_name, instance_id))
-                common.update_node(node_name, "state=DRAIN reason=instance_hibernated")
+            elif instance_attributes["State"]["Name"] == "stopped":
+                
+                if not "DRAIN" in node_states:
+                    logger.info("Node %s is linked with a hibernated instance %s. Setting to DRAIN" % (node_name, instance_id))
+                    common.update_node(node_name, "state=DRAIN reason=instance_hibernated")
+                # How long has this instance been hibernating for?
+                # Parse the time out of the transition string (ex. User initiated (2024-10-05 09:31:33 GMT))
+                if "MaxHibernationMin" in config:  # Set by user.
+                    num_min_hibernated = get_hibernation_time(instance_attributes["StateTransitionReason"])
+                    if num_min_hibernated > config["MaxHibernationMin"]:
+                        logger.info("Node %s has been hibernated for more than %s minutes. Will transplant to an On-Demand instance" % (node_name, config["MaxHibernationMin"]))
+                        instances_to_transplant[node_name] = instance_id
+                    
             elif "DRAIN" in node_states and instance_attributes["State"]["Name"] != "stopped":
                 logger.info("Node %s is linked with a non-hibernated instance %s. Setting to UNDRAIN" % (node_name, instance_id))
                 common.update_node(node_name, "state=UNDRAIN")
@@ -237,7 +255,27 @@ def process_fleet_nodes(client, nodes, instances, instance_rank, spot_requests, 
     orphan_instances = {x: y for x, y in instances.items() if x not in seen_instances}
     orphan_spot = list(x for x in spot_requests if x not in seen_spot)
 
-    return orphan_instances, orphan_spot
+    return instances_to_transplant, orphan_instances, orphan_spot
+
+
+def get_hibernation_time(state_transition_str):
+    """
+    Parse out the timestamp of an Instance hibernation, and compare it to the current time.
+
+    Time is returned in minutes.
+    """
+    hib_time = state_transition_str[state_transition_str.find("(") + 1: state_transition_str.rfind(")")]
+    if hib_time != "":  # We managed to parse out the time string from the state transition reason
+        try:
+            hib_time_obj = datetime.datetime.strptime(hib_time, "%Y-%m-%d %H:%M:%S %Z")
+        except ValueError as e:  # Did not parse the time correctly.
+            logger.debug("Unable to parse hibernation time of Instance %s from %s - %s" % (instance_id, hib_time, e))
+            hib_time_obj = datetime.datetime.now()
+        num_min_hibernated = datetime.datetime.now() - hib_time_obj
+        num_min_hibernated = num_min_hibernated.seconds / 60
+        logger.debug("Node %s has been hibernated for %s minutes" % (node_name, round(num_min_hibernated)))
+
+    return num_min_hibernated
 
 
 def terminate_instance(client, instance_id, instance_attributes):
@@ -377,6 +415,7 @@ def get_spot_interruption_rate(region, instance_type, interrupt_url = "https://s
     interrupt_ranking = region_instances[instance_type]["r"]  # Lower is better (i.e. less likely to be interrupted)
     return interrupt_ranking
 
+
 def get_spot_pricing(region, instance_type, pricing_url = "http://spot-price.s3.amazonaws.com/spot.js"):
     """
     Get the spot pricing for a given instance type.
@@ -461,21 +500,30 @@ def transplate_spot_to_od(client, node_name, instance_id, config, nodegroup_pref
     except Exception as e:
         logger.error("Unable to describe instance %s - %s" % (instance_id, e))
 
+    instance_ip = instance_info["PrivateIpAddress"]
+
     # To prevent AWS from resuming the Spot Instance while we are working on it, cancel the spot request, but
     # preserve the underyling "Instance".
-    cancel_spot(client, instance_id)
+    spot_id = instance_info["SpotInstanceRequestId"]
+    try:
+        response_describe = client.describe_spot_instance_requests(SpotInstanceRequestIds=[spot_id])
+    except Exception as e:
+        logger.error("Unable to cancel spot request %s - %s" % (spot_id, e))
 
     # Step 1: List all volumes associated with this instance and their mountpoints, and detatch them.
     spot_volumes = {}
-    for volume in instance_info["BlockDeviceMappings"]:
-        volume_id = volume["VolumeId"]
-        device = volume["DeviceName"]
-        spot_volumes[volume_id] = device
+    for device in instance_info["BlockDeviceMappings"]:
+        device_name = device["DeviceName"]
+        # Only track and dismount EBS. I have not tested this with other types of volumes (ex. EFS).
+        if "Ebs" in device:
+            volume = device["Ebs"]
+            volume_id = volume["VolumeId"]
+            spot_volumes[volume_id] = device_name
 
-        try:
-            detatch_response = client.detatch_volume(VolumeId=volume_id, InstanceId=instance_id)
-        except Exception as e:
-            logger.error("Unable to detatch volume %s (%s) from Instance %s - %s" % (volume_id, device, instance_id, e))
+            try:
+                detatch_response = client.detach_volume(VolumeId=volume_id, InstanceId=instance_id)
+            except Exception as e:
+                logger.error("Unable to detatch volume %s (%s) from Instance %s - %s" % (volume_id, device_name, instance_id, e))
 
     logger.debug("Found and detatched Volumes %s from instance %s" % (",".join(spot_volumes.keys()), instance_id))
 
@@ -483,7 +531,6 @@ def transplate_spot_to_od(client, node_name, instance_id, config, nodegroup_pref
     # Step 2 & 3: Terminate the Spot Instance, but preserve the Network Interface.
     interface_args = []  # A run-instance formatted request.
     eni_ids = []
-    primary_ip = None
     for interface in instance_info["NetworkInterfaces"]:
         eni_id = interface["NetworkInterfaceId"]
         network_card_index = interface["Attachment"]["NetworkCardIndex"]
@@ -492,12 +539,9 @@ def transplate_spot_to_od(client, node_name, instance_id, config, nodegroup_pref
         interface_args.append({"DeviceIndex": network_card_index, "NetworkInterfaceId": eni_id})
         eni_ids.append(eni_id)  # Only used for logging.
 
-        if network_card_index == 0:  # Primary device.
-            primary_ip = interface["PrivateIpAddress"]
-
         # Set this network interface to not terminate when the Instance terminates.
         try:
-            modify_response = client.modify_network_interface_attribute(Attachment={"AttachmentId": attachment_id, "DeleteOnTermination": "false"}, NetworkInterfaceId=eni_id)
+            modify_response = client.modify_network_interface_attribute(Attachment={"AttachmentId": attachment_id, "DeleteOnTermination": False}, NetworkInterfaceId=eni_id)
         except Exception as e:
             logger.error("Unable to modify network interface %s - %s" % (eni_id, e))
 
@@ -510,27 +554,69 @@ def transplate_spot_to_od(client, node_name, instance_id, config, nodegroup_pref
     # Step 4: Request an On-Demand Instance (the recipient) using the existing Network Interface.
     # Format the Network Interfaces 
     # NOTE: This must be the same type of instance as the Spot Instance so the boot drive is happy!
-    instance_type = [instance_info["InstanceType"]]
-    # Override the config to ensure we request an On-Demand instance.
-    config["PurchasingOption"] = "on-demand"
-    config["SubnetIds"] = [""]  # Will be specified by the Network Adapters
-    config["Overrides"] = {"NetworkInterfaces": interface_args}
-    recipient_info = request_new_instances(client, node_name, config, instance_type, nodegroup_prefix)
-    if recipient_info is None:  # We didn't recieve a replacement instance. Transplant failed.
-        logger.error("Unable to transplant instance %s as we could not request a new On-Demand instance" % instance_id)
+
+    # This is really annoying, but we can't use the Launch Template as we can't provide a SecurityGroup since we are providing a NetworkInterface.
+    # As the Launch template contains the security group and we can't override it with a null value, we need to unpack the launch template
+    # and formulate the arguments manually.
+    # Get the launch template.
+    try:
+        launch_template_response = client.describe_launch_template_versions(LaunchTemplateId=config["LaunchTemplate"])
+    except Exception as e:
+        logger.error("Unable to obtain information for Launch template %s - %s" % (config["LaunchTemplate"], e))
+
+    if "Overrides" in config:
+        config["Overrides"]["NetworkInterfaces"] = interface_args
+    else:
+        config["Overrides"] = {"NetworkInterfaces": interface_args}
+    # Unpack the launch template data.
+    for key, value in launch_template_response["LaunchTemplateVersions"][-1]["LaunchTemplateData"].items():  # Use the most recent version of the launch template.
+        # Prioritize any user-provided overrides
+        # Ignore the UserData, as this drive doesn't need to be fully initialized
+        if key != "SecurityGroupIds" and key != "UserData" and key not in config["Overrides"]:
+            config["Overrides"][key] = value
+
+    # Enable hibernation for this On-Demand instance
+    config["Overrides"]["HibernationOptions"] = {"Configured": True}
+
+    tag_specifications = [
+        {"ResourceType": "instance",
+         "Tags": [{"Key": "nodegroup","Value": nodegroup_prefix},
+                  {"Key": "launchtemplate", "Value": config["LaunchTemplate"]},  # We still will tag this instance with the LaunchTemplate even though we aren't technically using it
+                  {"Key": "Name", "Value": node_name}]
+        }
+    ]
+    time.sleep(10)  # Give the Network Interfaces and Volumes time to detatch
+    try:
+        logger.debug("Requesting recipient On-Demand Instance of type %s" % (instance_info["InstanceType"]))
+        instance_response = client.run_instances(InstanceType=instance_info["InstanceType"], MinCount=1, MaxCount=1, TagSpecifications=tag_specifications, **config["Overrides"])
+        logger.debug("Run Instance response - %s" % json.dumps(instance_response,indent=4,default=str))
+        # Did we manage to allocate nodes?
+        for instance in instance_response["Instances"]:
+            instance_id = instance["InstanceId"]
+            instance_ip = instance["PrivateIpAddress"]
+            common.update_node(node_name, "nodeaddr=%s nodehostname=%s comment=InstanceId:%s,SpotId:" % (instance_ip, node_name, instance_id))
+            update_hosts_file(node_name, instance_ip)
+            recipient_info = instance
+            break
+
+    except Exception as e:
+        logger.error("Unable to transplant instance %s as we could not request a new On-Demand instance - %s" % (instance_id, e))
         return None
 
     recipient_id = recipient_info["InstanceId"]
     logger.debug("Recieved recipient instance %s" % recipient_id)
 
+    logger.debug("Waiting for recipient instance %s to come online" % recipient_id)
     # Wait until this recpient is fully initialized.
-    # We will ping it to ensure the OS is fully initialized.
-    if primary_ip is not None:
-        for i in range(0, 40):  # Check for two minutes.
-            response = os.system("ping -c 1 -w2 " + primary_ip + " > /dev/null 2>&1")
-            if response == 0:  # We recieved a response. Recipient is up and ready.
+    for i in range(0, 60):  # Check for three minutes.
+        try:
+            status_check = client.describe_instance_status(InstanceIds=[recipient_id], Filters=[{"Name": "system-status.reachability", "Values": ["passed"]}])
+            if len(status_check["InstanceStatuses"]) > 0:  # The instance passed the status check.
                 break
-            time.sleep(3)
+        except Exception as e:
+            logger.debug("Unable to check status of instance %s - %s" % (recipient_id, e))
+        time.sleep(3)
+    time.sleep(20)
     logger.debug("Recipient instance %s is online" % recipient_id)
 
     # Step 5: Hibernate the On-Demand instance.
@@ -544,7 +630,7 @@ def transplate_spot_to_od(client, node_name, instance_id, config, nodegroup_pref
     
     # Wait until the On-Demand instance is hibernated.
     recipient_hibernated = False
-    for i in range(0, 40):  # Check for three minutes.
+    for i in range(0, 40):  # Check for two minutes.
         try:
             response_describe = client.describe_instances(InstanceIds=[recipient_id])
             for reservation in response_describe["Reservations"]:
@@ -553,7 +639,7 @@ def transplate_spot_to_od(client, node_name, instance_id, config, nodegroup_pref
                     if instance["State"]["Name"] == "stopped":
                         # Hibernation complete
                         recipient_hibernated = True
-                    instance_info = instance
+                    recipient_info = instance
         except Exception as e:
             logger.error("Unable to describe instance %s - %s" % (instance_id, e))
         if recipient_hibernated:
@@ -568,23 +654,29 @@ def transplate_spot_to_od(client, node_name, instance_id, config, nodegroup_pref
 
         # Set this network interface to not terminate when the Instance terminates.
         try:
-            modify_response = client.modify_network_interface_attribute(Attachment={"AttachmentId": attachment_id, "DeleteOnTermination": "true"}, NetworkInterfaceId=eni_id)
+            modify_response = client.modify_network_interface_attribute(Attachment={"AttachmentId": attachment_id, "DeleteOnTermination": True}, NetworkInterfaceId=eni_id)
         except Exception as e:
             logger.error("Unable to modify network interface %s - %s" % (eni_id, e))
 
     # Step 6: Remove the original volumes from the recipient.
     # We will delete them later to give them time to fully detatch
     recipient_volumes = []
-    for volume in recipient_info["BlockDeviceMappings"]:
-        volume_id = volume["VolumeId"]
-        recipient_volumes.append(volume_id)
-        try:
-            detatch_response = client.detatch_volume(VolumeId=volume_id, InstanceId=recipient_id)
-        except Exception as e:
-            logger.error("Unable to detatch volume %s from Instance %s - %s" % (volume_id, recipient_id, e))
+    for device in recipient_info["BlockDeviceMappings"]:
+
+        # Only track and dismount EBS. I have not tested this with other types of volumes (ex. EFS).
+        if "Ebs" in device:
+            volume = device["Ebs"]
+            volume_id = volume["VolumeId"]
+            recipient_volumes.append(volume_id)
+
+            try:
+                detatch_response = client.detach_volume(VolumeId=volume_id, InstanceId=recipient_id)
+            except Exception as e:
+                logger.error("Unable to detatch volume %s from Instance %s - %s" % (volume_id, recipient_id, e))
+
     logger.debug("Removed recipient volumes %s" % ",".join(recipient_volumes))
 
-    time.sleep(10)  # Give the drives time to fully detatch
+    time.sleep(10)  # Give the drives time to fully detatch.
 
     # Step 7: Attach the Spot volumes to the recipient instance.
     for volume_id, device in spot_volumes.items():
@@ -604,15 +696,15 @@ def transplate_spot_to_od(client, node_name, instance_id, config, nodegroup_pref
         logger.error("Unable to start recipient instance %s - %s" % (recipient_id, e))
 
     # Delete the old (donor) volumes
-    for volume in recipient_info["BlockDeviceMappings"]:
-        volume_id = volume["VolumeId"]
+    for volume_id in recipient_volumes:
         try:
             delete_response = client.delete_volume(VolumeId=volume_id)
         except Exception as e:
             logger.error("Unable to delete volume %s - %s" % (volume_id, e))
 
-    # (Finally) Update Slurm with the new Instance info
-    common.update_node(node_name, "nodeaddr=%s nodehostname=%s comment=InstanceId:%s,SpotId:%s weight=%s" % (primary_ip, node_name, recipient_id, "", 1))
+    # Finally, UNDRAIN the node as it is not hibernating any longer.
+    common.update_node(node_name, "state=UNDRAIN")
+
 
 # Get a list of all nodes and associated information from Slurm.
 all_node_info = scontrol_nodeinfo()
@@ -649,7 +741,7 @@ for partition_name, nodegroups in config["Partitions"].items():
                 logger.debug("Instances currently associated with this nodegroup: %s" % (list(instances.keys())))
                 logger.debug("Spot requests currently associated with this nodegroup: %s" % (spot_requests))
 
-                orphan_instances, orphan_spot = process_fleet_nodes(client, nodes, instances, instance_rank, spot_requests, nodegroup_atts, nodegroup_prefix)
+                transplant_instances, orphan_instances, orphan_spot = process_fleet_nodes(client, nodes, instances, instance_rank, spot_requests, nodegroup_atts, nodegroup_prefix)
 
                 # Are there any extraneous instances we should clean up?
                 if len(orphan_instances) > 0:
@@ -662,6 +754,20 @@ for partition_name, nodegroups in config["Partitions"].items():
                     logger.warning("Terminating orphan spot requests %s " % ",".join(orphan_spot))
                     for spot_id in orphan_spot:
                         cancel_spot(client, spot_id)
+
+            if len(transplant_instances) > 0:
+                logger.info("Transplanting instances %s" % ",".join(transplant_instances.keys()))
+                for node_name, instance_id in transplant_instances.items():
+                    # Lock these nodes while we transplant them.
+                    # We will set the node weight to 0 to indicate that this node is locked.
+                    common.update_node(node_name, "weight=0")
+                    try:
+                        transplate_spot_to_od(client, node_name, instance_id, nodegroup_atts, nodegroup_prefix)
+                    except Exception as e:
+                        raise e
+                    finally:
+                        common.update_node(node_name, "weight=1")
+
         except TimeoutError:
             logger.info("Unable to update process nodegroup \'%s\': Nodegroup locked" % nodegroup_prefix)
 
