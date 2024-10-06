@@ -55,6 +55,7 @@ def request_new_instances(client, node_name, config, instance_rank, nodegroup):
     launch_template = config["LaunchTemplate"]
     is_spot = config["PurchasingOption"] == "spot"
     interrupt_behavior = config["InteruptionBehavior"]
+    overrides = config["Overrides"]
     node_allocated = False
 
     tag_specifications = [
@@ -83,7 +84,7 @@ def request_new_instances(client, node_name, config, instance_rank, nodegroup):
                 try:
                     logger.debug("Requesting spot instance of type %s in subnet %s" % (instance_type, subnet))
                     instance_response = client.run_instances(LaunchTemplate={"LaunchTemplateId" :launch_template}, InstanceType=instance_type, MinCount=1, MaxCount=1, SubnetId=subnet,
-                                    InstanceMarketOptions=market_options, TagSpecifications=tag_specifications)
+                                    InstanceMarketOptions=market_options, TagSpecifications=tag_specifications, **overrides)
                     logger.debug("Run Instance response - %s" % json.dumps(instance_response,indent=4,default=str))
                     # Did we manage to allocate an instance?
                     for instance in instance_response["Instances"]:
@@ -114,7 +115,7 @@ def request_new_instances(client, node_name, config, instance_rank, nodegroup):
                 try:
                     logger.debug("Requesting On-Demand Instance of type %s in subnet %s" % (instance_type, subnet))
                     instance_response = client.run_instances(LaunchTemplate={"LaunchTemplateId" :launch_template}, InstanceType=instance_type, MinCount=1, 
-                                                             MaxCount=1, SubnetId=subnet, TagSpecifications=tag_specifications)
+                                                             MaxCount=1, SubnetId=subnet, TagSpecifications=tag_specifications, **overrides)
                     logger.debug("Run Instance response - %s" % json.dumps(instance_response,indent=4,default=str))
                     # Did we manage to allocate nodes?
                     for instance in instance_response["Instances"]:
@@ -139,7 +140,8 @@ def request_new_instances(client, node_name, config, instance_rank, nodegroup):
     if not node_allocated:
         # If we can't allocate enough instances right now, that is okay, we will try again the next time the daemon is run.
         logger.warning("Unable launch instance for node %s. Will try again later" % node_name)
-
+    else:
+        return instance_response
 
 # Compare the nodes that are currently running to those present in the fleet, and determine what changes are required.
 def process_fleet_nodes(client, nodes, instances, instance_rank, spot_requests, config, nodegroup):
@@ -424,6 +426,193 @@ def get_instance_priority(instances, allocation_strategy, purchasing_option):
 
     return instance_rank
 
+
+def transplate_spot_to_od(client, node_name, instance_id, config, nodegroup_prefix):
+    """
+    Resume a hibernated Spot Instance using an On-Demand instance.
+
+    1) Unmount the boot drive (and any additional drives) from the Spot Instance
+    2) Disconnect the Elastic Network Interface from the Spot Instance
+    3) Terminate the Spot Instance
+    4) Create an On-Demand Instance using the salvaged Elastic Network Interface.
+    5) Hibernate the On-Demand Instance
+    6) Remove the original Volumes from the On-Demand instance.
+    7) Attatch the Volumes salvaged from the Spot Instance
+    8) Resume the Hibernated Spot Instance.
+
+    """
+
+    logger.info("Transplating Spot Instance %s to an On-Demand Instance" % (instance_id))
+
+    # FAILSAFE: Sanity check that this instance is not running.
+    instance_info = {}
+    try:
+        response_describe = client.describe_instances(InstanceIds=[instance_id])
+        if len(response_describe["Reservations"]) > 0:
+            for reservation in response_describe["Reservations"]:
+                for instance in reservation["Instances"]:
+                    # Is this instance running?
+                    if instance["State"]["Name"] != "stopped":
+                        # This instance was resumed (or terminated?) since the daemon last got information for this instance.
+                        # Don't do anything.
+                        logger.warning("Aborting transplant of Spot Instance %s as it is currently not hibernated!" % instance_id)
+                        return None
+                    instance_info = instance
+    except Exception as e:
+        logger.error("Unable to describe instance %s - %s" % (instance_id, e))
+
+    # To prevent AWS from resuming the Spot Instance while we are working on it, cancel the spot request, but
+    # preserve the underyling "Instance".
+    cancel_spot(client, instance_id)
+
+    # Step 1: List all volumes associated with this instance and their mountpoints, and detatch them.
+    spot_volumes = {}
+    for volume in instance_info["BlockDeviceMappings"]:
+        volume_id = volume["VolumeId"]
+        device = volume["DeviceName"]
+        spot_volumes[volume_id] = device
+
+        try:
+            detatch_response = client.detatch_volume(VolumeId=volume_id, InstanceId=instance_id)
+        except Exception as e:
+            logger.error("Unable to detatch volume %s (%s) from Instance %s - %s" % (volume_id, device, instance_id, e))
+
+    logger.debug("Found and detatched Volumes %s from instance %s" % (",".join(spot_volumes.keys()), instance_id))
+
+    # Step 1 complete.
+    # Step 2 & 3: Terminate the Spot Instance, but preserve the Network Interface.
+    interface_args = []  # A run-instance formatted request.
+    eni_ids = []
+    primary_ip = None
+    for interface in instance_info["NetworkInterfaces"]:
+        eni_id = interface["NetworkInterfaceId"]
+        network_card_index = interface["Attachment"]["NetworkCardIndex"]
+        attachment_id = interface["Attachment"]["AttachmentId"]
+
+        interface_args.append({"DeviceIndex": network_card_index, "NetworkInterfaceId": eni_id})
+        eni_ids.append(eni_id)  # Only used for logging.
+
+        if network_card_index == 0:  # Primary device.
+            primary_ip = interface["PrivateIpAddress"]
+
+        # Set this network interface to not terminate when the Instance terminates.
+        try:
+            modify_response = client.modify_network_interface_attribute(Attachment={"AttachmentId": attachment_id, "DeleteOnTermination": "false"}, NetworkInterfaceId=eni_id)
+        except Exception as e:
+            logger.error("Unable to modify network interface %s - %s" % (eni_id, e))
+
+    logger.debug("Found (and preserving) Network Interfaces %s from instance %s" % (",".join(eni_ids), instance_id))
+
+    # Terminate the Spot Instance
+    terminate_instance(client, instance_id, {})
+    logger.debug("Terminated stripped Spot Instance %s" % instance_id)
+
+    # Step 4: Request an On-Demand Instance (the recipient) using the existing Network Interface.
+    # Format the Network Interfaces 
+    # NOTE: This must be the same type of instance as the Spot Instance so the boot drive is happy!
+    instance_type = [instance_info["InstanceType"]]
+    # Override the config to ensure we request an On-Demand instance.
+    config["PurchasingOption"] = "on-demand"
+    config["SubnetIds"] = [""]  # Will be specified by the Network Adapters
+    config["Overrides"] = {"NetworkInterfaces": interface_args}
+    recipient_info = request_new_instances(client, node_name, config, instance_type, nodegroup_prefix)
+    if recipient_info is None:  # We didn't recieve a replacement instance. Transplant failed.
+        logger.error("Unable to transplant instance %s as we could not request a new On-Demand instance" % instance_id)
+        return None
+
+    recipient_id = recipient_info["InstanceId"]
+    logger.debug("Recieved recipient instance %s" % recipient_id)
+
+    # Wait until this recpient is fully initialized.
+    # We will ping it to ensure the OS is fully initialized.
+    if primary_ip is not None:
+        for i in range(0, 40):  # Check for two minutes.
+            response = os.system("ping -c 1 -w2 " + primary_ip + " > /dev/null 2>&1")
+            if response == 0:  # We recieved a response. Recipient is up and ready.
+                break
+            time.sleep(3)
+    logger.debug("Recipient instance %s is online" % recipient_id)
+
+    # Step 5: Hibernate the On-Demand instance.
+    # NOTE: I am not sure if we need to hibernate this instance, or if we can transplant it from the stopped state?
+    # I am just doing this to be safe.
+    try:
+        hibernate_response = client.stop_instances(InstanceIds=[recipient_id], Hibernate=True)
+    except Exception as e:
+        logger.error("Unable to hibernate On-Demand instance %s - %s" % (recipient_id, e))
+        return None
+    
+    # Wait until the On-Demand instance is hibernated.
+    recipient_hibernated = False
+    for i in range(0, 40):  # Check for three minutes.
+        try:
+            response_describe = client.describe_instances(InstanceIds=[recipient_id])
+            for reservation in response_describe["Reservations"]:
+                for instance in reservation["Instances"]:
+                    # Is this instance hibernated?
+                    if instance["State"]["Name"] == "stopped":
+                        # Hibernation complete
+                        recipient_hibernated = True
+                    instance_info = instance
+        except Exception as e:
+            logger.error("Unable to describe instance %s - %s" % (instance_id, e))
+        if recipient_hibernated:
+            break
+        time.sleep(3)
+    logger.debug("Hibernated recipient instance %s" % recipient_id)
+
+    # Re-specify that the Network Interfaces should be deleted on instance termination.
+    for interface in recipient_info["NetworkInterfaces"]:
+        eni_id = interface["NetworkInterfaceId"]
+        attachment_id = interface["Attachment"]["AttachmentId"]
+
+        # Set this network interface to not terminate when the Instance terminates.
+        try:
+            modify_response = client.modify_network_interface_attribute(Attachment={"AttachmentId": attachment_id, "DeleteOnTermination": "true"}, NetworkInterfaceId=eni_id)
+        except Exception as e:
+            logger.error("Unable to modify network interface %s - %s" % (eni_id, e))
+
+    # Step 6: Remove the original volumes from the recipient.
+    # We will delete them later to give them time to fully detatch
+    recipient_volumes = []
+    for volume in recipient_info["BlockDeviceMappings"]:
+        volume_id = volume["VolumeId"]
+        recipient_volumes.append(volume_id)
+        try:
+            detatch_response = client.detatch_volume(VolumeId=volume_id, InstanceId=recipient_id)
+        except Exception as e:
+            logger.error("Unable to detatch volume %s from Instance %s - %s" % (volume_id, recipient_id, e))
+    logger.debug("Removed recipient volumes %s" % ",".join(recipient_volumes))
+
+    time.sleep(10)  # Give the drives time to fully detatch
+
+    # Step 7: Attach the Spot volumes to the recipient instance.
+    for volume_id, device in spot_volumes.items():
+        try:
+            client.attach_volume(Device=device, InstanceId=recipient_id, VolumeId=volume_id)
+        except Exception as e:
+            logger.error("Unable to attach volume %s (%s) to Instance %s - %s" % (volume_id, device, recipient_id, e))
+    logger.debug("Attached Spot Instance volumes %s to recipient %s" % (",".join(spot_volumes.keys()), recipient_id))
+
+    # Everything SHOULD be good to go!
+    # Step 8: Boot the new Frankenstein'd instance
+    logger.info("Finished transplanting Spot Instance %s to On-Demand instance %s" % (instance_id, recipient_id))
+    logger.debug("Booting recpient %s" % recipient_id)
+    try:
+        client.start_instances(InstanceIds = [recipient_id])
+    except Exception as e:
+        logger.error("Unable to start recipient instance %s - %s" % (recipient_id, e))
+
+    # Delete the old (donor) volumes
+    for volume in recipient_info["BlockDeviceMappings"]:
+        volume_id = volume["VolumeId"]
+        try:
+            delete_response = client.delete_volume(VolumeId=volume_id)
+        except Exception as e:
+            logger.error("Unable to delete volume %s - %s" % (volume_id, e))
+
+    # (Finally) Update Slurm with the new Instance info
+    common.update_node(node_name, "nodeaddr=%s nodehostname=%s comment=InstanceId:%s,SpotId:%s weight=%s" % (primary_ip, node_name, recipient_id, "", 1))
 
 # Get a list of all nodes and associated information from Slurm.
 all_node_info = scontrol_nodeinfo()
