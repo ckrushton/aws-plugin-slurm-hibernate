@@ -67,6 +67,7 @@ if [ "\$2" = "hibernate" ] || [ "\$2" = "hybrid-sleep" ]; then
     case "\$1" in
         post)
             timeout 120s ls /shared/ &>/dev/null && echo NFS online || echo NFS not mounted before timeout reached. Continuing...
+            systemctl restart slurmd
             ;;
     esac
 fi

@@ -127,14 +127,16 @@ Resources:
                   - ec2:CreateTags
                   - ec2:DeleteTags
                   - ec2:DeleteVolume
+                  - ec2:DeleteNetworkInterface
                   - ec2:DescribeLaunchTemplateVersions
                   - ec2:DescribeInstances
                   - ec2:DescribeInstanceStatus
                   - ec2:DescribeInstanceTypes
                   - ec2:DescribeSpotInstanceRequests
-                  - ec2:DetatchVolume
+                  - ec2:DetachVolume
                   - ec2:ModifyNetworkInterfaceAttribute
                   - ec2:RunInstances
+                  - ec2:StartInstances
                   - ec2:StopInstances
                   - ec2:TerminateInstances
                   - iam:CreateServiceLinkedRole
@@ -323,7 +325,7 @@ Resources:
                      "SuspendProgram": "$SLURM_HOME/etc/aws/suspend.py",
                      "ResumeRate": 100,
                      "SuspendRate": 100,
-                     "ResumeTimeout": 300,
+                     "ResumeTimeout": 600,
                      "SuspendTime": 300,
                      "TreeWidth": 60000,
                      "GresTypes": "gres"
@@ -508,8 +510,8 @@ Resources:
 
               # Launch Slurmctld
               mkdir -p /var/spool/slurm
-              'cp' /nfs/slurm/etc/slurm/slurmd.service /lib/systemd/system
-              'cp' /nfs/slurm/etc/slurm/slurmctld.service /lib/systemd/system
+              cp /nfs/slurm/etc/slurm/slurmd.service /lib/systemd/system
+              cp /nfs/slurm/etc/slurm/slurmctld.service /lib/systemd/system
               systemctl enable slurmctld
               systemctl start slurmctld
 
@@ -578,10 +580,15 @@ Resources:
             def handler(event, context):
 
               response = {}
-              if event["RequestType"] == "Delete":
-                delete()
-                response["output"] = "Instances terminated"
-              cfnresponse.send(event, context, cfnresponse.SUCCESS, response)
+              response_code = cfnresponse.SUCCESS
+              try:
+                if event["RequestType"] == "Delete":
+                  delete()
+                  response["output"] = "Instances terminated"
+              except Exception as e:  # Failed to clean up
+                reponse_code = cfnresponse.FAILED
+                response["Reason"] = e
+              cfnresponse.send(event, context, response_code, response)
 
       FunctionName:
         Fn::Join:
