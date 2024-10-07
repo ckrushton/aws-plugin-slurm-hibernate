@@ -51,8 +51,10 @@ def update_hosts_file(node_name, ip, hostfile="/etc/hosts"):
 
 
 # Request new EC2 instances and assign to Slurm nodes.
-def request_new_instances(client, node_name, config, instance_rank, nodegroup):
+def request_new_instances(client, node_names, config, instance_rank, nodegroup):
 
+    num_nodes = len(node_names)
+    node_index = 0
     launch_template = config["LaunchTemplate"]
     is_spot = config["PurchasingOption"] == "spot"
     interrupt_behavior = config["InteruptionBehavior"]
@@ -60,18 +62,15 @@ def request_new_instances(client, node_name, config, instance_rank, nodegroup):
         overrides = config["Overrides"]
     except KeyError:  # No overrides specified
         overrides = {}
-    node_allocated = False
 
     tag_specifications = [
         {"ResourceType": "instance",
          "Tags": [{"Key": "nodegroup","Value": nodegroup},
-                  {"Key": "launchtemplate", "Value": launch_template},
-                  {"Key": "Name", "Value": node_name}]
+                  {"Key": "launchtemplate", "Value": launch_template}]
         },
         {"ResourceType": "spot-instances-request",
          "Tags": [{"Key": "nodegroup","Value": nodegroup},
-                  {"Key": "launchtemplate", "Value": launch_template},
-                  {"Key": "Name", "Value": node_name}]
+                  {"Key": "launchtemplate", "Value": launch_template}]
         }
     ]
     market_options = {}
@@ -86,19 +85,22 @@ def request_new_instances(client, node_name, config, instance_rank, nodegroup):
         for instance_type in instance_rank:
             for subnet in config["SubnetIds"]:
                 try:
-                    logger.debug("Requesting spot instance of type %s in subnet %s" % (instance_type, subnet))
-                    instance_response = client.run_instances(LaunchTemplate={"LaunchTemplateId" :launch_template}, InstanceType=instance_type, MinCount=1, MaxCount=1, SubnetId=subnet,
+                    num_outstanding_nodes = num_nodes - node_index
+                    logger.debug("Requesting %s Spot Instance of type %s in subnet %s" % (num_outstanding_nodes, instance_type, subnet))
+                    instance_response = client.run_instances(LaunchTemplate={"LaunchTemplateId" :launch_template}, InstanceType=instance_type, MinCount=1, MaxCount=num_outstanding_nodes, SubnetId=subnet,
                                     InstanceMarketOptions=market_options, TagSpecifications=tag_specifications, **overrides)
                     logger.debug("Run Instance response - %s" % json.dumps(instance_response,indent=4,default=str))
                     # Did we manage to allocate an instance?
                     for instance in instance_response["Instances"]:
+                        node_name = node_names[node_index]
+                        node_index += 1
                         instance_id = instance["InstanceId"]
                         instance_ip = instance["PrivateIpAddress"]
                         spot_id = instance["SpotInstanceRequestId"]
                         common.update_node(node_name, "nodeaddr=%s nodehostname=%s comment=InstanceId:%s,SpotId:%s weight=%s" % (instance_ip, node_name, instance_id, spot_id, 2))
                         update_hosts_file(node_name, instance_ip)
-                        node_allocated = True
-                        break
+                        # Tag this instance.
+                        client.create_tags(Resources=[instance_id, spot_id], Tags=[{"Key": "Name", "Value": node_name}])
 
                     # To not flood AWS API with requests.
                     time.sleep(0.1)
@@ -106,29 +108,32 @@ def request_new_instances(client, node_name, config, instance_rank, nodegroup):
                 except Exception as e:
                     logger.info("Unable to fullfill spot request for %s instances in subnet %s - %s" % (instance_type, subnet, e))
 
-                if node_allocated:
+                if num_nodes == node_index:
                     break
-            if node_allocated:
+            if num_nodes == node_index:
                 break
 
     # If this is an on-demand fleet or we can't allocate spot instances, request on-demand instances.
-    if not node_allocated:
+    if num_nodes != node_index:
         tag_specifications.pop(-1)  # Remove the spot instance tagging.
         for instance_type in config["Instances"]:
             for subnet in config["SubnetIds"]:
                 try:
-                    logger.debug("Requesting On-Demand Instance of type %s in subnet %s" % (instance_type, subnet))
+                    num_outstanding_nodes = len(node_names) - node_index
+                    logger.debug("Requesting %s On-Demand Instances of type %s in subnet %s" % (num_outstanding_nodes, instance_type, subnet))
                     instance_response = client.run_instances(LaunchTemplate={"LaunchTemplateId" :launch_template}, InstanceType=instance_type, MinCount=1, 
-                                                             MaxCount=1, SubnetId=subnet, TagSpecifications=tag_specifications, **overrides)
+                                                             MaxCount=num_outstanding_nodes, SubnetId=subnet, TagSpecifications=tag_specifications, **overrides)
                     logger.debug("Run Instance response - %s" % json.dumps(instance_response,indent=4,default=str))
                     # Did we manage to allocate nodes?
                     for instance in instance_response["Instances"]:
+                        node_name = node_names[node_index]
+                        node_index += 1
                         instance_id = instance["InstanceId"]
                         instance_ip = instance["PrivateIpAddress"]
                         common.update_node(node_name, "nodeaddr=%s nodehostname=%s comment=InstanceId:%s,SpotId:%s weight=%s" % (instance_ip, node_name, instance_id, "", 1))
                         update_hosts_file(node_name, instance_ip)
-                        node_allocated = True
-                        break
+                        # Tag this instance.
+                        client.create_tags(Resources=[instance_id], Tags=[{"Key": "Name", "Value": node_name}])
 
                     # To not flood AWS API with requests.
                     time.sleep(0.1)
@@ -136,20 +141,21 @@ def request_new_instances(client, node_name, config, instance_rank, nodegroup):
                 except Exception as e:
                     logger.info("Unable to fullfill On-Demand request for %s instance in subnet %s - %s" % (instance_type, subnet, e))
 
-                if node_allocated:
+                if num_nodes == node_index:
                     break
-            if node_allocated:
+            if num_nodes == node_index:
                 break
 
-    if not node_allocated:
+    if num_nodes != node_index:
         # If we can't allocate enough instances right now, that is okay, we will try again the next time the daemon is run.
-        logger.warning("Unable launch instance for node %s. Will try again later" % node_name)
+        logger.warning("Unable launch %s instances for nodegroup %s. Will try again later" % nodegroup)
     else:
         return instance_response
 
 # Compare the nodes that are currently running to those present in the fleet, and determine what changes are required.
-def process_fleet_nodes(client, nodes, instances, instance_rank, spot_requests, config, nodegroup):
+def process_fleet_nodes(client, nodes, instances, spot_requests, config):
 
+    nodes_to_start = []
     instances_to_transplant = {}
     seen_instances = []
     seen_spot = []
@@ -182,8 +188,9 @@ def process_fleet_nodes(client, nodes, instances, instance_rank, spot_requests, 
 
         node_states = set(node_attributes["State"])
 
-        if node_attributes["Weight"] == 0:
+        if node_attributes["Weight"] == "0":
             logger.info("Node %s has its Weight set to 0 and is thus locked. Skipping..." % node_name)
+            continue
 
         # If this node has been powered down because it went down, reset it and set it to idle.
         # Let the node fully power down first so we don't overwhelm Slurm.
@@ -199,7 +206,7 @@ def process_fleet_nodes(client, nodes, instances, instance_rank, spot_requests, 
             if "POWERING_UP" in node_states:
                 # We need to allocate an instance to this node.
                 logger.info("Node %s is POWERING_UP. Allocating instance" % node_name)
-                request_new_instances(client, node_name, config, instance_rank, nodegroup)
+                nodes_to_start.append(node_name)
             elif "POWERED_DOWN" in node_states or "POWERING_DOWN" in node_states:
                 # Node is powered down, and no instance is linked. This is the appropriate senario.
                 # Ensure the node is not tagged with an instance.
@@ -236,7 +243,7 @@ def process_fleet_nodes(client, nodes, instances, instance_rank, spot_requests, 
                         logger.info("Node %s has been hibernated for more than %s minutes. Will transplant to an On-Demand instance" % (node_name, config["MaxHibernationMin"]))
                         instances_to_transplant[node_name] = instance_id
                     
-            elif "DRAIN" in node_states and instance_attributes["State"]["Name"] != "stopped":
+            elif "DRAIN" in node_states and instance_attributes["State"]["Name"] not in ["terminated", "stopping"]:
                 logger.info("Node %s is linked with a non-hibernated instance %s. Setting to UNDRAIN" % (node_name, instance_id))
                 common.update_node(node_name, "state=UNDRAIN")
             # Node is stuck.
@@ -245,7 +252,7 @@ def process_fleet_nodes(client, nodes, instances, instance_rank, spot_requests, 
                 common.update_node(node_name, "state=POWER_DOWN reason=node_stuck")
             # In some situations, a node may be placed in COMPLETING+DRAIN state by Slurm 
             # and remains stuck. In that case, force the node to become DOWN
-            if "COMPLETING" in node_states and ("DRAIN" in node_states or "NOT_RESPONDING" in node_states):
+            if "COMPLETING" in node_states and "NOT_RESPONDING" in node_states:
                 common.update_node(node_name, "state=POWER_DOWN_FORCE reason=node_stuck")
             if instance_ip != node_attributes["NodeAddr"]:
                 logger.info("Node %s is assigned an IP address of %s, but linked instance %s has an IP address of %s. Updating..." % (node_name, node_attributes["NodeAddr"], instance_id, instance_ip))
@@ -255,7 +262,7 @@ def process_fleet_nodes(client, nodes, instances, instance_rank, spot_requests, 
     orphan_instances = {x: y for x, y in instances.items() if x not in seen_instances}
     orphan_spot = list(x for x in spot_requests if x not in seen_spot)
 
-    return instances_to_transplant, orphan_instances, orphan_spot
+    return nodes_to_start, instances_to_transplant, orphan_instances, orphan_spot
 
 
 def get_hibernation_time(state_transition_str):
@@ -269,11 +276,11 @@ def get_hibernation_time(state_transition_str):
         try:
             hib_time_obj = datetime.datetime.strptime(hib_time, "%Y-%m-%d %H:%M:%S %Z")
         except ValueError as e:  # Did not parse the time correctly.
-            logger.debug("Unable to parse hibernation time of Instance %s from %s - %s" % (instance_id, hib_time, e))
+            logger.debug("Unable to parse hibernation time from %s - %s" % (hib_time, e))
             hib_time_obj = datetime.datetime.now()
         num_min_hibernated = datetime.datetime.now() - hib_time_obj
         num_min_hibernated = num_min_hibernated.seconds / 60
-        logger.debug("Node %s has been hibernated for %s minutes" % (node_name, round(num_min_hibernated)))
+        logger.debug("Node has been hibernated for %s minutes" % round(num_min_hibernated))
 
     return num_min_hibernated
 
@@ -466,6 +473,26 @@ def get_instance_priority(instances, allocation_strategy, purchasing_option):
     return instance_rank
 
 
+def cleanup_transplant(volumes = None, network_interfaces = None):
+    """
+    Delete orphan resources from a successful (or unsucessful) Spot -> On-Demand transplant
+    """
+    
+    if volumes is not None:
+        for volume in volumes:
+            try:
+                delete_response = client.delete_volume(VolumeId=volume)
+            except Exception as e:
+                logger.error("Unable to delete volume %s - %s" % (volume, e))
+
+    if network_interfaces is not None:
+        for interface in network_interfaces:
+            try:
+                delete_response = client.delete_network_interface(NetworkInterfaceId=interface)
+            except Exception as e:
+                logger.error("Unable to delete Network Interface %s - %s" % (interface, e))
+
+
 def transplate_spot_to_od(client, node_name, instance_id, config, nodegroup_prefix):
     """
     Resume a hibernated Spot Instance using an On-Demand instance.
@@ -476,8 +503,8 @@ def transplate_spot_to_od(client, node_name, instance_id, config, nodegroup_pref
     4) Create an On-Demand Instance using the salvaged Elastic Network Interface.
     5) Hibernate the On-Demand Instance
     6) Remove the original Volumes from the On-Demand instance.
-    7) Attatch the Volumes salvaged from the Spot Instance
-    8) Resume the Hibernated Spot Instance.
+    7) Attatch the Volumes salvaged from the Spot Instance.
+    8) Resume the Hibernated On-Demand Instance.
 
     """
 
@@ -499,16 +526,18 @@ def transplate_spot_to_od(client, node_name, instance_id, config, nodegroup_pref
                     instance_info = instance
     except Exception as e:
         logger.error("Unable to describe instance %s - %s" % (instance_id, e))
+        return None
 
     instance_ip = instance_info["PrivateIpAddress"]
 
-    # To prevent AWS from resuming the Spot Instance while we are working on it, cancel the spot request, but
+    # To prevent AWS from resuming the Spot Instance while we are working on it, cancel the spot request but
     # preserve the underyling "Instance".
     spot_id = instance_info["SpotInstanceRequestId"]
     try:
-        response_describe = client.describe_spot_instance_requests(SpotInstanceRequestIds=[spot_id])
+        response_cancel = client.cancel_spot_instance_requests(SpotInstanceRequestIds=[spot_id])
     except Exception as e:
         logger.error("Unable to cancel spot request %s - %s" % (spot_id, e))
+        # We don't need abort here, as orphan Spot Instances will be cleaned up by the Daemon.
 
     # Step 1: List all volumes associated with this instance and their mountpoints, and detatch them.
     spot_volumes = {}
@@ -518,12 +547,15 @@ def transplate_spot_to_od(client, node_name, instance_id, config, nodegroup_pref
         if "Ebs" in device:
             volume = device["Ebs"]
             volume_id = volume["VolumeId"]
-            spot_volumes[volume_id] = device_name
-
+            
             try:
                 detatch_response = client.detach_volume(VolumeId=volume_id, InstanceId=instance_id)
             except Exception as e:
                 logger.error("Unable to detatch volume %s (%s) from Instance %s - %s" % (volume_id, device_name, instance_id, e))
+                cleanup_transplant(volumes=spot_volumes.keys())
+                return None
+            
+            spot_volumes[volume_id] = device_name
 
     logger.debug("Found and detatched Volumes %s from instance %s" % (",".join(spot_volumes.keys()), instance_id))
 
@@ -537,13 +569,15 @@ def transplate_spot_to_od(client, node_name, instance_id, config, nodegroup_pref
         attachment_id = interface["Attachment"]["AttachmentId"]
 
         interface_args.append({"DeviceIndex": network_card_index, "NetworkInterfaceId": eni_id})
-        eni_ids.append(eni_id)  # Only used for logging.
+        eni_ids.append(eni_id)
 
         # Set this network interface to not terminate when the Instance terminates.
         try:
             modify_response = client.modify_network_interface_attribute(Attachment={"AttachmentId": attachment_id, "DeleteOnTermination": False}, NetworkInterfaceId=eni_id)
         except Exception as e:
             logger.error("Unable to modify network interface %s - %s" % (eni_id, e))
+            cleanup_transplant(volumes=spot_volumes.keys(), network_interfaces=eni_ids)
+            return None
 
     logger.debug("Found (and preserving) Network Interfaces %s from instance %s" % (",".join(eni_ids), instance_id))
 
@@ -552,17 +586,17 @@ def transplate_spot_to_od(client, node_name, instance_id, config, nodegroup_pref
     logger.debug("Terminated stripped Spot Instance %s" % instance_id)
 
     # Step 4: Request an On-Demand Instance (the recipient) using the existing Network Interface.
-    # Format the Network Interfaces 
     # NOTE: This must be the same type of instance as the Spot Instance so the boot drive is happy!
 
-    # This is really annoying, but we can't use the Launch Template as we can't provide a SecurityGroup since we are providing a NetworkInterface.
-    # As the Launch template contains the security group and we can't override it with a null value, we need to unpack the launch template
-    # and formulate the arguments manually.
+    # This is really annoying, but we can't use the Launch Template as it includes a Security Group, but that is specified by the NetworkInterface.
+    # As we can't Override the Security Group with a null value, we need to unpack the launch template and formulate the arguments manually.
     # Get the launch template.
     try:
         launch_template_response = client.describe_launch_template_versions(LaunchTemplateId=config["LaunchTemplate"])
     except Exception as e:
         logger.error("Unable to obtain information for Launch template %s - %s" % (config["LaunchTemplate"], e))
+        cleanup_transplant(volumes=spot_volumes.keys(), network_interfaces=eni_ids)
+        return None
 
     if "Overrides" in config:
         config["Overrides"]["NetworkInterfaces"] = interface_args
@@ -601,12 +635,13 @@ def transplate_spot_to_od(client, node_name, instance_id, config, nodegroup_pref
 
     except Exception as e:
         logger.error("Unable to transplant instance %s as we could not request a new On-Demand instance - %s" % (instance_id, e))
+        cleanup_transplant(volumes=spot_volumes.keys(), network_interfaces=eni_ids)
         return None
 
     recipient_id = recipient_info["InstanceId"]
     logger.debug("Recieved recipient instance %s" % recipient_id)
 
-    logger.debug("Waiting for recipient instance %s to come online" % recipient_id)
+    logger.debug("Waiting for recipient instance %s to come online. This will take a few minutes..." % recipient_id)
     # Wait until this recpient is fully initialized.
     for i in range(0, 60):  # Check for three minutes.
         try:
@@ -626,6 +661,7 @@ def transplate_spot_to_od(client, node_name, instance_id, config, nodegroup_pref
         hibernate_response = client.stop_instances(InstanceIds=[recipient_id], Hibernate=True)
     except Exception as e:
         logger.error("Unable to hibernate On-Demand instance %s - %s" % (recipient_id, e))
+        cleanup_transplant(volumes=spot_volumes.keys(), network_interfaces=eni_ids)
         return None
     
     # Wait until the On-Demand instance is hibernated.
@@ -657,6 +693,8 @@ def transplate_spot_to_od(client, node_name, instance_id, config, nodegroup_pref
             modify_response = client.modify_network_interface_attribute(Attachment={"AttachmentId": attachment_id, "DeleteOnTermination": True}, NetworkInterfaceId=eni_id)
         except Exception as e:
             logger.error("Unable to modify network interface %s - %s" % (eni_id, e))
+            cleanup_transplant(volumes=spot_volumes.keys(), network_interfaces=eni_ids)
+            return None
 
     # Step 6: Remove the original volumes from the recipient.
     # We will delete them later to give them time to fully detatch
@@ -673,6 +711,9 @@ def transplate_spot_to_od(client, node_name, instance_id, config, nodegroup_pref
                 detatch_response = client.detach_volume(VolumeId=volume_id, InstanceId=recipient_id)
             except Exception as e:
                 logger.error("Unable to detatch volume %s from Instance %s - %s" % (volume_id, recipient_id, e))
+                cleanup_transplant(volumes=spot_volumes.keys(), network_interfaces=eni_ids)
+                cleanup_transplant(volumes=recipient_volumes)
+                return None
 
     logger.debug("Removed recipient volumes %s" % ",".join(recipient_volumes))
 
@@ -684,10 +725,14 @@ def transplate_spot_to_od(client, node_name, instance_id, config, nodegroup_pref
             client.attach_volume(Device=device, InstanceId=recipient_id, VolumeId=volume_id)
         except Exception as e:
             logger.error("Unable to attach volume %s (%s) to Instance %s - %s" % (volume_id, device, recipient_id, e))
+            cleanup_transplant(volumes=spot_volumes.keys(), network_interfaces=eni_ids)
+            cleanup_transplant(volumes=recipient_volumes)
+            return None
+
     logger.debug("Attached Spot Instance volumes %s to recipient %s" % (",".join(spot_volumes.keys()), recipient_id))
 
     # Everything SHOULD be good to go!
-    # Step 8: Boot the new Frankenstein'd instance
+    # Step 8: Boot the new Frankenstein'd instance.
     logger.info("Finished transplanting Spot Instance %s to On-Demand instance %s" % (instance_id, recipient_id))
     logger.debug("Booting recpient %s" % recipient_id)
     try:
@@ -695,14 +740,10 @@ def transplate_spot_to_od(client, node_name, instance_id, config, nodegroup_pref
     except Exception as e:
         logger.error("Unable to start recipient instance %s - %s" % (recipient_id, e))
 
-    # Delete the old (donor) volumes
-    for volume_id in recipient_volumes:
-        try:
-            delete_response = client.delete_volume(VolumeId=volume_id)
-        except Exception as e:
-            logger.error("Unable to delete volume %s - %s" % (volume_id, e))
+    # Delete the old (donor) volumes.
+    cleanup_transplant(volumes=recipient_volumes)
 
-    # Finally, UNDRAIN the node as it is not hibernating any longer.
+    # Finally, UNDRAIN the node as it is no longer hibernating.
     common.update_node(node_name, "state=UNDRAIN")
 
 
@@ -741,7 +782,11 @@ for partition_name, nodegroups in config["Partitions"].items():
                 logger.debug("Instances currently associated with this nodegroup: %s" % (list(instances.keys())))
                 logger.debug("Spot requests currently associated with this nodegroup: %s" % (spot_requests))
 
-                transplant_instances, orphan_instances, orphan_spot = process_fleet_nodes(client, nodes, instances, instance_rank, spot_requests, nodegroup_atts, nodegroup_prefix)
+                nodes_to_start, transplant_instances, orphan_instances, orphan_spot = process_fleet_nodes(client, nodes, instances, spot_requests, nodegroup_atts)
+
+                if len(nodes_to_start) > 0:
+                    logger.info("Requesting %s Instances in nodegroup %s" % (len(nodes_to_start), nodegroup_prefix))
+                    request_new_instances(client, nodes_to_start, nodegroup_atts, instance_rank, nodegroup_prefix)
 
                 # Are there any extraneous instances we should clean up?
                 if len(orphan_instances) > 0:
@@ -755,18 +800,21 @@ for partition_name, nodegroups in config["Partitions"].items():
                     for spot_id in orphan_spot:
                         cancel_spot(client, spot_id)
 
-            if len(transplant_instances) > 0:
-                logger.info("Transplanting instances %s" % ",".join(transplant_instances.keys()))
-                for node_name, instance_id in transplant_instances.items():
-                    # Lock these nodes while we transplant them.
-                    # We will set the node weight to 0 to indicate that this node is locked.
-                    common.update_node(node_name, "weight=0")
-                    try:
-                        transplate_spot_to_od(client, node_name, instance_id, nodegroup_atts, nodegroup_prefix)
-                    except Exception as e:
-                        raise e
-                    finally:
-                        common.update_node(node_name, "weight=1")
+                if len(transplant_instances) > 0:
+                    
+                    for node_name, instance_id in transplant_instances.items():
+                        # Lock these nodes while we transplant them.
+                        # We will set the node weight to 0 to indicate that this node is locked.
+                        logger.info("Transplanting instance %s" % instance_id)
+                        common.update_node(node_name, "weight=0")
+                        try:
+                            transplate_spot_to_od(client, node_name, instance_id, nodegroup_atts, nodegroup_prefix)
+                        except Exception as e:
+                            raise e
+                        finally:
+                            common.update_node(node_name, "weight=1")
+                        # Only transplant one instance per daemon run, so our info isn't too obsolete.
+                        break
 
         except TimeoutError:
             logger.info("Unable to update process nodegroup \'%s\': Nodegroup locked" % nodegroup_prefix)
