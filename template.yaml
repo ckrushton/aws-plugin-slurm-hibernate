@@ -238,10 +238,13 @@ Resources:
               mkdir -p /nfs
               mkdir -p /shared
               sudo chmod 777 /shared/
-              mount -t nfs ${HeadNodeNetworkInterface.PrimaryPrivateIpAddress}:/nfs /nfs
-              mount -t nfs ${HeadNodeNetworkInterface.PrimaryPrivateIpAddress}:/shared /shared
-              # Give the DNS a few seconds to register this node before starting Slurmd
-              sleep 40
+
+              # Adapted from https://docs.aws.amazon.com/efs/latest/ug/mounting-fs-old.html
+              cat >> /etc/fstab << EOF
+              ${HeadNodeNetworkInterface.PrimaryPrivateIpAddress}:/nfs /nfs nfs noresvport,rsize=1048576,wsize=1048576,hard,timeo=600,_netdev,x-systemd.after=network-online.target
+              ${HeadNodeNetworkInterface.PrimaryPrivateIpAddress}:/shared /shared nfs noresvport,rsize=1048576,wsize=1048576,hard,timeo=600,_netdev,x-systemd.after=network-online.target
+              EOF
+              mount --all
 
               export SLURM_HOME=/nfs/slurm
               mkdir -p /var/spool/slurm
@@ -305,8 +308,8 @@ Resources:
               # Configure NFS share
               # Only export to instances on this subnet
               mkdir -p /nfs
-              echo "/nfs $cidr_block(rw,async,no_subtree_check,no_root_squash)" | tee /etc/exports
-              echo "$mountpoint $cidr_block(rw,async,no_subtree_check,no_root_squash)" | tee --append /etc/exports
+              echo "/nfs $cidr_block(rw,async,no_subtree_check,no_root_squash,insecure)" | tee /etc/exports
+              echo "$mountpoint $cidr_block(rw,async,no_subtree_check,no_root_squash,insecure)" | tee --append /etc/exports
               systemctl enable nfs-server
               systemctl start nfs-server
               exportfs -av
