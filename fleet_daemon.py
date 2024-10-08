@@ -51,7 +51,7 @@ def update_hosts_file(node_name, ip, hostfile="/etc/hosts"):
 
 
 # Request new EC2 instances and assign to Slurm nodes.
-def request_new_instances(client, node_names, config, instance_rank, nodegroup):
+def request_new_instances(client, node_names, config, instance_rank, nodegroup, max_spot_override=16):
 
     num_nodes = len(node_names)
     node_index = 0
@@ -87,7 +87,7 @@ def request_new_instances(client, node_names, config, instance_rank, nodegroup):
                 try:
                     num_outstanding_nodes = num_nodes - node_index
                     logger.debug("Requesting %s Spot Instance of type %s in subnet %s" % (num_outstanding_nodes, instance_type, subnet))
-                    instance_response = client.run_instances(LaunchTemplate={"LaunchTemplateId" :launch_template}, InstanceType=instance_type, MinCount=1, MaxCount=num_outstanding_nodes, SubnetId=subnet,
+                    instance_response = client.run_instances(LaunchTemplate={"LaunchTemplateId" :launch_template}, InstanceType=instance_type, MinCount=1, MaxCount=min(num_outstanding_nodes,max_spot_override), SubnetId=subnet,
                                     InstanceMarketOptions=market_options, TagSpecifications=tag_specifications, **overrides)
                     logger.debug("Run Instance response - %s" % json.dumps(instance_response,indent=4,default=str))
                     # Did we manage to allocate an instance?
@@ -121,7 +121,7 @@ def request_new_instances(client, node_names, config, instance_rank, nodegroup):
                 try:
                     num_outstanding_nodes = len(node_names) - node_index
                     logger.debug("Requesting %s On-Demand Instances of type %s in subnet %s" % (num_outstanding_nodes, instance_type, subnet))
-                    instance_response = client.run_instances(LaunchTemplate={"LaunchTemplateId" :launch_template}, InstanceType=instance_type, MinCount=1, 
+                    instance_response = client.run_instances(LaunchTemplate={"LaunchTemplateId" :launch_template}, InstanceType=instance_type, MinCount=1,
                                                              MaxCount=num_outstanding_nodes, SubnetId=subnet, TagSpecifications=tag_specifications, **overrides)
                     logger.debug("Run Instance response - %s" % json.dumps(instance_response,indent=4,default=str))
                     # Did we manage to allocate nodes?
@@ -164,7 +164,7 @@ def process_fleet_nodes(client, nodes, instances, spot_requests, config):
     for node_name, node_attributes in nodes.items():
         # Has this node been associated with an EC2 instance?
         logger.info("Processing node %s" % node_name)
-        
+
         instance_id = None
         instance_id_raw = ""
         instance_attributes = {}
@@ -216,47 +216,41 @@ def process_fleet_nodes(client, nodes, instances, spot_requests, config):
                 # Node is up, but there is no associated instance (was it terminated outside of Slurm's control?)
                 # Set this node to DOWN.
                 common.update_node(node_name, "state=POWER_DOWN_FORCE reason=instance_terminated")
-        else:
+        elif "POWERED_DOWN" in node_states or "POWERING_DOWN" in node_states:
+            # If there is still an EC2 instance linked with this node, terminate it.
+            if instance_attributes["State"]["Name"] not in ["terminated", "stopping"]:
+                logger.info("Node %s is set to POWER_DOWN. Terminating linked instance %s" % (node_name, instance_id))
+                terminate_instance(client, instance_id, instance_attributes)
+                # Remove this linked node, as it is terminated.
+                common.update_node(node_name, "Comment=InstanceId:,SpotId:")
+        # If the underlying instance is hibernated, set it to DRAIN to prevent additional jobs from being allocated to this node.
+        elif instance_attributes["State"]["Name"] == "stopped":
+            if not "DRAIN" in node_states:
+                logger.info("Node %s is linked with a hibernated instance %s. Setting to DRAIN" % (node_name, instance_id))
+                common.update_node(node_name, "state=DRAIN reason=instance_hibernated")
+            # How long has this instance been hibernating for?
+            # Parse the time out of the transition string (ex. User initiated (2024-10-05 09:31:33 GMT))
+            if "MaxHibernationMin" in config:  # Set by user.
+                num_min_hibernated = get_hibernation_time(instance_attributes["StateTransitionReason"])
+                if num_min_hibernated > config["MaxHibernationMin"]:
+                    logger.info("Node %s has been hibernated for more than %s minutes. Will transplant to an On-Demand instance" % (node_name, config["MaxHibernationMin"]))
+                    instances_to_transplant[node_name] = instance_id
+        # Instance is UP
+        elif instance_attributes["State"]["Name"] not in ["terminated", "stopping"]:
             # An instance is allocated to this node.
             # Check to ensure the IP address for the node is correct.
-            instance_ip = instance_attributes["PrivateIpAddress"]
-            # If this node is powered down, terminate the associated instance.
-            if "POWERED_DOWN" in node_states or "POWERING_DOWN" in node_states:
-                # If there is still an EC2 instance linked with this node, terminate it.
-                if instance_attributes["State"]["Name"] not in ["terminated", "stopping"]:
-                    logger.info("Node %s is set to POWER_DOWN. Terminating linked instance %s" % (node_name, instance_id))
-                    terminate_instance(client, instance_id, instance_attributes)
-                    # Remove this linked node, as it is terminated.
-                    common.update_node(node_name, "Comment=InstanceId:,SpotId:")
-            # Instance is UP
-            # If the underlying instance is hibernated, set it to DRAIN to prevent additional jobs from being allocated to this node.
-            elif instance_attributes["State"]["Name"] == "stopped":
-                
-                if not "DRAIN" in node_states:
-                    logger.info("Node %s is linked with a hibernated instance %s. Setting to DRAIN" % (node_name, instance_id))
-                    common.update_node(node_name, "state=DRAIN reason=instance_hibernated")
-                # How long has this instance been hibernating for?
-                # Parse the time out of the transition string (ex. User initiated (2024-10-05 09:31:33 GMT))
-                if "MaxHibernationMin" in config:  # Set by user.
-                    num_min_hibernated = get_hibernation_time(instance_attributes["StateTransitionReason"])
-                    if num_min_hibernated > config["MaxHibernationMin"]:
-                        logger.info("Node %s has been hibernated for more than %s minutes. Will transplant to an On-Demand instance" % (node_name, config["MaxHibernationMin"]))
-                        instances_to_transplant[node_name] = instance_id
-                    
-            elif "DRAIN" in node_states and instance_attributes["State"]["Name"] not in ["terminated", "stopping"]:
-                logger.info("Node %s is linked with a non-hibernated instance %s. Setting to UNDRAIN" % (node_name, instance_id))
-                common.update_node(node_name, "state=UNDRAIN")
-            # Node is stuck.
-            elif "DOWN" in node_states:
-                logger.error("Node %s is stuck and has been set to DOWN. Powering down and resetting..." % (node_name))
-                common.update_node(node_name, "state=POWER_DOWN reason=node_stuck")
-            # In some situations, a node may be placed in COMPLETING+DRAIN state by Slurm 
-            # and remains stuck. In that case, force the node to become DOWN
-            if "COMPLETING" in node_states and "NOT_RESPONDING" in node_states:
-                common.update_node(node_name, "state=POWER_DOWN_FORCE reason=node_stuck")
-            if instance_ip != node_attributes["NodeAddr"]:
-                logger.info("Node %s is assigned an IP address of %s, but linked instance %s has an IP address of %s. Updating..." % (node_name, node_attributes["NodeAddr"], instance_id, instance_ip))
-                common.update_node(node_name, "nodeaddr=%s" % instance_ip)
+           instance_ip = instance_attributes["PrivateIpAddress"]
+
+           if "DRAIN" in node_states:
+               logger.info("Node %s is linked with a non-hibernated instance %s. Setting to RESUME" % (node_name, instance_id))
+               common.update_node(node_name, "state=RESUME")
+           # Node is stuck.
+           elif "DOWN" in node_states and not "DRAIN" in node_states:
+               logger.error("Node %s is stuck and has been set to DOWN. Powering down and resetting..." % (node_name))
+               common.update_node(node_name, "state=POWER_DOWN reason=node_stuck")
+           if instance_ip != node_attributes["NodeAddr"]:
+               logger.info("Node %s is assigned an IP address of %s, but linked instance %s has an IP address of %s. Updating..." % (node_name, node_attributes["NodeAddr"], instance_id, instance_ip))
+               common.update_node(node_name, "nodeaddr=%s" % instance_ip)
 
     # Are there any instances which are not associated with a node?
     orphan_instances = {x: y for x, y in instances.items() if x not in seen_instances}
@@ -295,8 +289,8 @@ def terminate_instance(client, instance_id, instance_attributes):
             logger.info("Terminated Instance %s" % (instance_id))
         except Exception as e:
             logger.error("Failed to terminate Instance %s - %s" %(instance_id, e))
-    
-    # To prevent Spot requests from being re-fulfilled even after their instance is terminated, 
+
+    # To prevent Spot requests from being re-fulfilled even after their instance is terminated,
     # cancel the associated Spot requests.
     if "SpotInstanceRequestId" in instance_attributes:
         spot_id = instance_attributes["SpotInstanceRequestId"]
@@ -364,7 +358,7 @@ def scontrol_nodeinfo():
 def get_all_instances_for_nodegroup(client, launch_template, nodegroup):
 
     filter_string = [
-        {"Name": "tag:launchtemplate", 
+        {"Name": "tag:launchtemplate",
          "Values": [launch_template],
         },
         {"Name": "tag:nodegroup",
@@ -413,12 +407,12 @@ def get_spot_interruption_rate(region, instance_type, interrupt_url = "https://s
     if region not in interrupt_json["spot_advisor"]:
         logger.warning("Unable to obtain Spot Instance interruption likelihood for region %s" % region)
         return 10  # Return a super high ranking, so this is prioritized last.
-    
+
     region_instances = interrupt_json["spot_advisor"][region]["Linux"]
     if instance_type not in region_instances:
         logger.warning("Unable to obtain Spot Instance interruption likelihood for instance type %s in region %s" % (instance_type, region))
         return 10  # Return a super high ranking, so this is prioritized last.
-    
+
     interrupt_ranking = region_instances[instance_type]["r"]  # Lower is better (i.e. less likely to be interrupted)
     return interrupt_ranking
 
@@ -477,7 +471,7 @@ def cleanup_transplant(volumes = None, network_interfaces = None):
     """
     Delete orphan resources from a successful (or unsucessful) Spot -> On-Demand transplant
     """
-    
+
     if volumes is not None:
         for volume in volumes:
             try:
@@ -547,14 +541,14 @@ def transplate_spot_to_od(client, node_name, instance_id, config, nodegroup_pref
         if "Ebs" in device:
             volume = device["Ebs"]
             volume_id = volume["VolumeId"]
-            
+
             try:
                 detatch_response = client.detach_volume(VolumeId=volume_id, InstanceId=instance_id)
             except Exception as e:
                 logger.error("Unable to detatch volume %s (%s) from Instance %s - %s" % (volume_id, device_name, instance_id, e))
                 cleanup_transplant(volumes=spot_volumes.keys())
                 return None
-            
+
             spot_volumes[volume_id] = device_name
 
     logger.debug("Found and detatched Volumes %s from instance %s" % (",".join(spot_volumes.keys()), instance_id))
@@ -663,7 +657,7 @@ def transplate_spot_to_od(client, node_name, instance_id, config, nodegroup_pref
         logger.error("Unable to hibernate On-Demand instance %s - %s" % (recipient_id, e))
         cleanup_transplant(volumes=spot_volumes.keys(), network_interfaces=eni_ids)
         return None
-    
+
     # Wait until the On-Demand instance is hibernated.
     recipient_hibernated = False
     for i in range(0, 40):  # Check for two minutes.
@@ -743,8 +737,8 @@ def transplate_spot_to_od(client, node_name, instance_id, config, nodegroup_pref
     # Delete the old (donor) volumes.
     cleanup_transplant(volumes=recipient_volumes)
 
-    # Finally, UNDRAIN the node as it is no longer hibernating.
-    common.update_node(node_name, "state=UNDRAIN")
+    # Finally, RESUME the node as it is no longer hibernating.
+    common.update_node(node_name, "state=RESUME")
 
 
 # Get a list of all nodes and associated information from Slurm.
@@ -757,7 +751,7 @@ boto3_config = botocore.config.Config(
 client = boto3.client('ec2', region_name=region, config=boto3_config)
 
 for partition_name, nodegroups in config["Partitions"].items():
- 
+
     for nodegroup_name, nodegroup_atts in nodegroups.items():
 
         # Prevent two instances of the daemon from processing the same node group concurrently.
@@ -800,21 +794,21 @@ for partition_name, nodegroups in config["Partitions"].items():
                     for spot_id in orphan_spot:
                         cancel_spot(client, spot_id)
 
-                if len(transplant_instances) > 0:
-                    
-                    for node_name, instance_id in transplant_instances.items():
-                        # Lock these nodes while we transplant them.
-                        # We will set the node weight to 0 to indicate that this node is locked.
-                        logger.info("Transplanting instance %s" % instance_id)
-                        common.update_node(node_name, "weight=0")
-                        try:
-                            transplate_spot_to_od(client, node_name, instance_id, nodegroup_atts, nodegroup_prefix)
-                        except Exception as e:
-                            raise e
-                        finally:
-                            common.update_node(node_name, "weight=1")
-                        # Only transplant one instance per daemon run, so our info isn't too obsolete.
-                        break
+            if len(transplant_instances) > 0:
+
+                for node_name, instance_id in transplant_instances.items():
+                    # Lock these nodes while we transplant them.
+                    # We will set the node weight to 0 to indicate that this node is locked.
+                    logger.info("Transplanting instance %s" % instance_id)
+                    common.update_node(node_name, "weight=0")
+                    try:
+                        transplate_spot_to_od(client, node_name, instance_id, nodegroup_atts, nodegroup_prefix)
+                    except Exception as e:
+                        raise e
+                    finally:
+                        common.update_node(node_name, "weight=1")
+                    # Only transplant one instance per daemon run, so our info isn't too obsolete.
+                    break
 
         except TimeoutError:
             logger.info("Unable to update process nodegroup \'%s\': Nodegroup locked" % nodegroup_prefix)
