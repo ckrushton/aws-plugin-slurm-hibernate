@@ -71,7 +71,15 @@ def request_new_instances(client, node_names, config, instance_rank, nodegroup, 
         {"ResourceType": "spot-instances-request",
          "Tags": [{"Key": "nodegroup","Value": nodegroup},
                   {"Key": "launchtemplate", "Value": launch_template}]
-        }
+        },
+        {"ResourceType": "network-interface",
+         "Tags": [{"Key": "nodegroup","Value": nodegroup},
+                  {"Key": "launchtemplate", "Value": launch_template}]
+        },
+        {"ResourceType": "volume",
+         "Tags": [{"Key": "nodegroup","Value": nodegroup},
+                  {"Key": "launchtemplate", "Value": launch_template}]
+        },
     ]
     market_options = {}
     if is_spot:
@@ -115,7 +123,7 @@ def request_new_instances(client, node_names, config, instance_rank, nodegroup, 
 
     # If this is an on-demand fleet or we can't allocate spot instances, request on-demand instances.
     if num_nodes != node_index:
-        tag_specifications.pop(-1)  # Remove the spot instance tagging.
+        tag_specifications = list(x for x in tag_specifications if x["ResourceType"] != "spot-instances-request")  # Remove the spot instance tagging.
         for instance_type in config["Instances"]:
             for subnet in config["SubnetIds"]:
                 try:

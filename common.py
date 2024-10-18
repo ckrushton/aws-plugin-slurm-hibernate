@@ -10,7 +10,6 @@ dir_path = os.path.dirname(os.path.realpath(__file__))  # Folder where resides t
 
 logger = None  # Global variable for the logging.Logger object
 config = None  # Global variable for the config parameters
-partitions = None  # Global variable that stores partitions details
 
 # Create and return a logging.Logger object
 # - scriptname: name of the module
@@ -70,7 +69,11 @@ def validate_config(config):
             assert nodegroup_attributes["AllocationStrategy"] in ("rank", "lowest-price", "capacity-optimized", "price-capacity-optimized")
             
             assert "InteruptionBehavior" in nodegroup_attributes
-            assert nodegroup_attributes["InteruptionBehavior"] in ("stop", "terminate", "hibernate")
+            assert nodegroup_attributes["InteruptionBehavior"] in ("terminate", "stop", "hibernate")
+
+            # Persistant allocations can't use a terminate interrupt strategy.
+            if nodegroup_attributes["PurchasingOption"] == "spot":
+                assert nodegroup_attributes["InteruptionBehavior"] != "terminate"
 
             assert "LaunchTemplate" in nodegroup_attributes
             assert "SubnetIds" in nodegroup_attributes
@@ -83,7 +86,6 @@ def get_common(scriptname):
 
     global logger
     global config
-    global partitions
 
     # Load configuration parameters from ./config.json and merge with default values
     try:

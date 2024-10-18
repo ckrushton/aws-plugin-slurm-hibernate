@@ -16,7 +16,7 @@ Parameters:
 
   LatestAmiId:
     Type: String
-    Default: ami-0bba1c902eb2316e8
+    Default: ami-0faf0c88332d7ded6
     Description: AMI to be used for head node and cluster node creation
 
   HeadNodeInstanceType:
@@ -26,8 +26,8 @@ Parameters:
 
   NodeHibernateMaxTime:
     Type: Number
-    Default: "1800"
-    Description: How many seconds should Slurm wait for a hibernated node to resume before requesting a replacement node? Set to 0 for infinite.
+    Default: "45"
+    Description: How many minutes should we wait until we transition a hibernated Spot instance to an On-Demand instance?
 
 Metadata: 
   AWS::CloudFormation::Interface: 
@@ -56,7 +56,7 @@ Metadata:
       LatestAmiId: 
         default: Latest cluster template AMI (created using ami_configuration_script.sh)
       NodeHibernateMaxTime:
-        default: Time (seconds)
+        default: Time (minutes)
 
 Resources:
   SecurityGroup:
@@ -340,7 +340,7 @@ Resources:
                               "PurchasingOption": "spot",
                               "AllocationStrategy": "price-capacity-optimized",
                               "InteruptionBehavior": "hibernate",
-                              "MaxHibernationMin": 45,
+                              "MaxHibernationMin": ${NodeHibernateMaxTime},
                               "LaunchTemplate": "${ComputeNodeLaunchTemplate}",
                               "SubnetIds": [
                                   "${Subnet1Id}"
@@ -357,7 +357,7 @@ Resources:
                               "PurchasingOption": "spot",
                               "AllocationStrategy": "price-capacity-optimized",
                               "InteruptionBehavior": "hibernate",
-                              "MaxHibernationMin": 45,
+                              "MaxHibernationMin": ${NodeHibernateMaxTime},
                               "LaunchTemplate": "${ComputeNodeLaunchTemplate}",
                               "SubnetIds": [
                                   "${Subnet1Id}"
@@ -410,7 +410,7 @@ Resources:
               ReturnToService=2
               # TIMERS
               SlurmctldTimeout=300
-              SlurmdTimeout=${NodeHibernateMaxTime}
+              SlurmdTimeout=3600
               InactiveLimit=0
               MinJobAge=300
               KillWait=30
@@ -558,16 +558,9 @@ Resources:
 
                     # Terminate the instance (one at a time, so if one instance fails to terminate it doesn't prevent the others)
                     try:
-                      client.terminate_instance(InstanceIds=[instance_id])
+                      client.terminate_instances(InstanceIds=[instance_id])
                     except Exception:
                       pass
-                    # Terminate the associated spot request (if present)
-                    if "SpotInstanceRequestId" in instance:
-                      spot_id = instance["SpotInstanceRequestId"]
-                      try:
-                        client.cancel_spot_instance_requests(SpotInstanceRequestIds=[spot_id])
-                      except Exception:
-                        pass
 
               # Get all spot requests associated with this Stack.
               instance_filters.append({"Name": "state", "Values": ["open", "active"]})
@@ -575,7 +568,7 @@ Resources:
               # Cancel the open spot requests
               for request in response_describe["SpotInstanceRequests"]:
                 try:
-                  client.cancel_spot_instance_requests(SpotInstanceRequestIds=request["SpotInstanceRequestId"])
+                  client.cancel_spot_instance_requests(SpotInstanceRequestIds=[request["SpotInstanceRequestId"]])
                 except Exception:
                   pass
 
