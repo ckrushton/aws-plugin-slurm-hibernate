@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
 
-import json
-import filelock
-import os
 import sys
-import time
-
 import common
 
 logger, config = common.get_common('suspend')
@@ -19,6 +14,3 @@ except:
     sys.exit(1)
 
 logger.debug('Nodes to suspend: %s', hostlist)
-
-
-
