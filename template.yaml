@@ -239,6 +239,17 @@ Resources:
               mkdir -p /shared
               sudo chmod 777 /shared/
 
+              # Set the pretty hostname to the nodename assigned by Slurm
+              # This is used a fallback strategy to obtain the nodename for slurmd after resuming from hibernation
+              # in case the resumed instance is no longer authenticated with AWS at startup.
+              instanceid=`/usr/bin/curl --fail -m 2 -s http://169.254.169.254/latest/meta-data/instance-id`
+              if [[ ! -z "$instanceid" ]]; then
+                  hostname=$(aws ec2 describe-tags --region ${AWS::Region} --filters "Name=resource-id,Values=$instanceid" "Name=key,Values=Name" --output text | cut -f5)
+                  if [[ $hostname != "" ]]; then
+                      hostnamectl set-hostname --pretty $hostname
+                  fi
+              fi
+
               # Adapted from https://docs.aws.amazon.com/efs/latest/ug/mounting-fs-old.html
               cat >> /etc/fstab << EOF
               ${HeadNodeNetworkInterface.PrimaryPrivateIpAddress}:/nfs /nfs nfs noresvport,rsize=1048576,wsize=1048576,hard,timeo=600,_netdev,x-systemd.after=network-online.target
@@ -248,7 +259,7 @@ Resources:
 
               export SLURM_HOME=/nfs/slurm
               mkdir -p /var/spool/slurm
-              'cp' $SLURM_HOME/etc/slurm/slurmd.service /lib/systemd/system
+              cp $SLURM_HOME/etc/slurm/slurmd.service /lib/systemd/system
               systemctl enable slurmd.service
               systemctl start slurmd.service
 
@@ -454,7 +465,11 @@ Resources:
               if [ ! -z "$hostname" -a "$hostname" != "None" ]; then
                  echo $hostname
               else
-                 echo `hostname`
+                 hostname=$(hostnamectl hostname --pretty)
+                 if [[ $hostname == "" ]]; then
+                     hostname=$(hostname)
+                 fi
+                 echo $hostname
               fi
               EOF
               chmod +x $SLURM_HOME/etc/aws/get_nodename
