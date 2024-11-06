@@ -156,9 +156,11 @@ def request_new_instances(client, node_names, config, instance_rank, nodegroup, 
 
     if num_nodes != node_index:
         # If we can't allocate enough instances right now, that is okay, we will try again the next time the daemon is run.
-        logger.warning("Unable launch %s instances for nodegroup %s. Will try again later" % nodegroup)
+        num_outstanding_nodes = num_nodes - node_index
+        logger.warning("Unable launch %s instances for nodegroup %s. Will try again later" % (num_outstanding_nodes, nodegroup))
     else:
         return instance_response
+
 
 # Compare the nodes that are currently running to those present in the fleet, and determine what changes are required.
 def process_fleet_nodes(client, nodes, instances, spot_requests, config):
