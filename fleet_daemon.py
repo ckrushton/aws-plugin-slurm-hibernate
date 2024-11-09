@@ -105,7 +105,7 @@ def request_new_instances(client, node_names, config, instance_rank, nodegroup, 
                         instance_id = instance["InstanceId"]
                         instance_ip = instance["PrivateIpAddress"]
                         spot_id = instance["SpotInstanceRequestId"]
-                        common.update_node(node_name, "nodeaddr=%s nodehostname=%s comment=InstanceId:%s,SpotId:%s weight=%s" % (instance_ip, node_name, instance_id, spot_id, 2))
+                        common.update_node(node_name, "nodeaddr=%s nodehostname=%s comment=InstanceId:%s,SpotId:%s weight=%s" % (instance_ip, node_name, instance_id, spot_id, 1))
                         update_hosts_file(node_name, instance_ip)
                         # Tag this instance.
                         client.create_tags(Resources=[instance_id, spot_id], Tags=[{"Key": "Name", "Value": node_name}])
@@ -138,7 +138,7 @@ def request_new_instances(client, node_names, config, instance_rank, nodegroup, 
                         node_index += 1
                         instance_id = instance["InstanceId"]
                         instance_ip = instance["PrivateIpAddress"]
-                        common.update_node(node_name, "nodeaddr=%s nodehostname=%s comment=InstanceId:%s,SpotId:%s weight=%s" % (instance_ip, node_name, instance_id, "", 1))
+                        common.update_node(node_name, "nodeaddr=%s nodehostname=%s comment=InstanceId:%s,SpotId:%s weight=%s" % (instance_ip, node_name, instance_id, "", 2))
                         update_hosts_file(node_name, instance_ip)
                         # Tag this instance.
                         client.create_tags(Resources=[instance_id], Tags=[{"Key": "Name", "Value": node_name}])
@@ -816,7 +816,7 @@ for partition_name, nodegroups in config["Partitions"].items():
                     except Exception as e:
                         raise e
                     finally:
-                        common.update_node(node_name, "weight=1")
+                        common.update_node(node_name, "weight=2")
                     # Only transplant one instance per daemon run, so our info isn't too obsolete.
                     break
 
