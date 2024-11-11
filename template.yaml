@@ -284,9 +284,17 @@ Resources:
 
               # Configure local storage (if availible).
               mountpoint=/shared/
-              fdisk -l
               # NOTE: This is only tested on Ubuntu 22.04!
-              localdisks=($(fdisk -l | grep -o '/dev/nvme[0-9]*n[0-9]*' | grep -v nvme0))
+              # Get a list of all disks which do not have filesystems (i.e. uninitialized local storage).
+              localdisks=$(
+                while read line; do
+                  instance_storage=$(fdisk -l $line | grep "Instance Storage")
+                  if [[ $instance_storage != "" ]]; then
+                    echo $line
+                  fi
+                done < <(awk '{print("/dev/"$4)}' /proc/partitions)
+              )
+              localdisks=($localdisks)
 
               if [[ ${!#localdisks[*]} -gt 0 ]]; then
                 # Local storage present. Do we have multiple drives?
