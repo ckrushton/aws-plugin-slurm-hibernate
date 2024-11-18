@@ -486,6 +486,8 @@ Resources:
               [Unit]
               Description=Slurm node daemon
               After=munge.service network.target remote-fs.target
+              StartLimitIntervalSec=180s
+              StartLimitBurst=6
               [Service]
               Type=forking
               EnvironmentFile=-/etc/sysconfig/slurmd
@@ -498,6 +500,8 @@ Resources:
               LimitMEMLOCK=infinity
               LimitSTACK=infinity
               Delegate=yes
+              Restart=on-failure
+              RestartSec=10s
               [Install]
               WantedBy=multi-user.target
               EOF
