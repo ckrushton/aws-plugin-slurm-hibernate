@@ -173,7 +173,7 @@ def process_fleet_nodes(client, nodes, instances, spot_requests, config):
     # Process all nodes in this partition and nodegroup.
     for node_name, node_attributes in nodes.items():
         # Has this node been associated with an EC2 instance?
-        logger.info("Processing node %s" % node_name)
+        logger.debug("Processing node %s" % node_name)
 
         instance_id = None
         instance_id_raw = ""
@@ -727,6 +727,9 @@ def transplate_spot_to_od(client, node_name, instance_id, config, nodegroup_pref
     for volume_id, device in spot_volumes.items():
         try:
             client.attach_volume(Device=device, InstanceId=recipient_id, VolumeId=volume_id)
+            time.sleep(5)  # Wait a few seconds for the device to mount.
+            # Set this volume to automatically delete itself when the associated instance is deleted.
+            client.modify_instance_attribute(InstanceId=recipient_id, BlockDeviceMapping=[{"DeviceName": device, "Ebs": {"DeleteOnTermination": True}}])
         except Exception as e:
             logger.error("Unable to attach volume %s (%s) to Instance %s - %s" % (volume_id, device, recipient_id, e))
             cleanup_transplant(volumes=spot_volumes.keys(), network_interfaces=eni_ids)
