@@ -82,6 +82,7 @@ def request_new_instances(client, node_names, config, instance_rank, nodegroup, 
         },
     ]
     market_options = {}
+    spot_types_allocated = []
     if is_spot:
         market_options = {"MarketType": "spot",
                           "SpotOptions": {
@@ -96,7 +97,7 @@ def request_new_instances(client, node_names, config, instance_rank, nodegroup, 
                     num_outstanding_nodes = num_nodes - node_index
                     logger.debug("Requesting %s Spot Instance of type %s in subnet %s" % (num_outstanding_nodes, instance_type, subnet))
                     instance_response = client.run_instances(LaunchTemplate={"LaunchTemplateId" :launch_template}, InstanceType=instance_type, MinCount=1, MaxCount=min(num_outstanding_nodes,max_spot_override), SubnetId=subnet,
-                                    InstanceMarketOptions=market_options, TagSpecifications=tag_specifications, **overrides)
+                            InstanceMarketOptions=market_options, TagSpecifications=tag_specifications, HibernationOptions={"Configured": True}, **overrides)
                     logger.debug("Run Instance response - %s" % json.dumps(instance_response,indent=4,default=str))
                     # Did we manage to allocate an instance?
                     for instance in instance_response["Instances"]:
@@ -110,8 +111,9 @@ def request_new_instances(client, node_names, config, instance_rank, nodegroup, 
                         # Tag this instance.
                         client.create_tags(Resources=[instance_id, spot_id], Tags=[{"Key": "Name", "Value": node_name}])
 
-                    # To not flood AWS API with requests.
+                    # To not flood the AWS API with requests.
                     time.sleep(0.1)
+                    spot_types_allocated.append(instance_type)
 
                 except Exception as e:
                     logger.info("Unable to fullfill spot request for %s instances in subnet %s - %s" % (instance_type, subnet, e))
@@ -123,14 +125,24 @@ def request_new_instances(client, node_names, config, instance_rank, nodegroup, 
 
     # If this is an on-demand fleet or we can't allocate spot instances, request on-demand instances.
     if num_nodes != node_index:
+
+        # If we managed to allocate one or more Spot instances, we should de-prioritize launching
+        # those instance types, as we don't want to incentivize AWS to interrupt our newly requested spot instances.
+        if len(spot_types_allocated) == 0:
+            od_instance_type_order = config["Instances"]
+        else:
+            logger.debug(f"Down-prioritizing launching On-demand instances of {spot_types_allocated} as we obtained Spot instances of these types")
+            od_instance_type_order = list(x for x in config["Instances"] if x not in spot_types_allocated)
+            od_instance_type_order.extend(spot_types_allocated)
+
         tag_specifications = list(x for x in tag_specifications if x["ResourceType"] != "spot-instances-request")  # Remove the spot instance tagging.
-        for instance_type in config["Instances"]:
+        for instance_type in od_instance_type_order:
             for subnet in config["SubnetIds"]:
                 try:
                     num_outstanding_nodes = len(node_names) - node_index
                     logger.debug("Requesting %s On-Demand Instances of type %s in subnet %s" % (num_outstanding_nodes, instance_type, subnet))
                     instance_response = client.run_instances(LaunchTemplate={"LaunchTemplateId" :launch_template}, InstanceType=instance_type, MinCount=1,
-                                                             MaxCount=num_outstanding_nodes, SubnetId=subnet, TagSpecifications=tag_specifications, **overrides)
+                                                             MaxCount=num_outstanding_nodes, SubnetId=subnet, TagSpecifications=tag_specifications, HibernationOptions={"Configured": False}, **overrides)
                     logger.debug("Run Instance response - %s" % json.dumps(instance_response,indent=4,default=str))
                     # Did we manage to allocate nodes?
                     for instance in instance_response["Instances"]:
@@ -158,8 +170,9 @@ def request_new_instances(client, node_names, config, instance_rank, nodegroup, 
         # If we can't allocate enough instances right now, that is okay, we will try again the next time the daemon is run.
         num_outstanding_nodes = num_nodes - node_index
         logger.warning("Unable launch %s instances for nodegroup %s. Will try again later" % (num_outstanding_nodes, nodegroup))
+        return False
     else:
-        return instance_response
+        return True
 
 
 # Compare the nodes that are currently running to those present in the fleet, and determine what changes are required.
@@ -173,7 +186,7 @@ def process_fleet_nodes(client, nodes, instances, spot_requests, config):
     # Process all nodes in this partition and nodegroup.
     for node_name, node_attributes in nodes.items():
         # Has this node been associated with an EC2 instance?
-        logger.debug("Processing node %s" % node_name)
+        logger.info("Processing node %s" % node_name)
 
         instance_id = None
         instance_id_raw = ""
@@ -727,9 +740,9 @@ def transplate_spot_to_od(client, node_name, instance_id, config, nodegroup_pref
     for volume_id, device in spot_volumes.items():
         try:
             client.attach_volume(Device=device, InstanceId=recipient_id, VolumeId=volume_id)
-            time.sleep(5)  # Wait a few seconds for the device to mount.
-            # Set this volume to automatically delete itself when the associated instance is deleted.
-            client.modify_instance_attribute(InstanceId=recipient_id, BlockDeviceMapping=[{"DeviceName": device, "Ebs": {"DeleteOnTermination": True}}])
+            time.sleep(5)  # Wait a few seconds for the volume to attach.
+            # Re-specify that the volume should be deleted when the instance is deleted.
+            client.modify_instance_attribute(InstanceId=recipient_id, BlockDeviceMappings=[{"DeviceName": device, "Ebs": {"DeleteOnTermination": True}}])
         except Exception as e:
             logger.error("Unable to attach volume %s (%s) to Instance %s - %s" % (volume_id, device, recipient_id, e))
             cleanup_transplant(volumes=spot_volumes.keys(), network_interfaces=eni_ids)

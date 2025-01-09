@@ -216,20 +216,6 @@ Resources:
             !Sub |
               #!/bin/bash -x
 
-              # As starting an instance from a snapshot doesn't actually sync the contents of that snapshot to 
-              # the EBS volume, we need to initialize the volume to avoid a MASSIVE performance hit if the 
-              # instance is hibernated.
-              # (Even writing to free space requires the snapshot contents to be synced from S3)
-              # Get the root device name
-              root_dev=$(lsblk --noheadings --paths --output PKNAME $( findmnt --noheadings --output SOURCE --mountpoint / ))
-              if [[ $root_dev == "" ]]; then
-                root_dev =$(findmnt --noheadings --output SOURCE --mountpoint /)
-              fi
-
-              if [[ $root_dev != "" ]]; then
-                fio --filename=$root_dev --rw=read --bs=10M --iodepth=32 --ioengine=libaio --direct=1 --name=volume-initialize &
-              fi
-
               # Start NFS and mount head node directories
               sudo rm /lib/systemd/system/nfs-common.service
               systemctl daemon-reload
