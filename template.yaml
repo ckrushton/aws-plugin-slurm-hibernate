@@ -323,7 +323,7 @@ Resources:
 
               cat > $SLURM_HOME/etc/aws/config.json <<EOF
               {
-                  "LogLevel": "DEBUG",
+                  "LogLevel": "INFO",
                   "LogFileName": "/var/log/slurm_plugin.log",
                   "SlurmBinPath": "$SLURM_HOME/bin",
                   "Region": "${AWS::Region}",

@@ -186,7 +186,7 @@ def process_fleet_nodes(client, nodes, instances, spot_requests, config):
     # Process all nodes in this partition and nodegroup.
     for node_name, node_attributes in nodes.items():
         # Has this node been associated with an EC2 instance?
-        logger.info("Processing node %s" % node_name)
+        logger.debug("Processing node %s" % node_name)
 
         instance_id = None
         instance_id_raw = ""
