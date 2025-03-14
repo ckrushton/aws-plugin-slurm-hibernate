@@ -234,7 +234,7 @@ def process_fleet_nodes(client, nodes, instances, spot_requests, config):
                 # Node is powered down, and no instance is linked. This is the appropriate senario.
                 # Ensure the node is not tagged with an instance.
                 if instance_id_raw != "" and instance_id is None:
-                    common.update_node(node_name, "Comment=InstanceId:,SpotId:")
+                    common.update_node(node_name, "Comment=InstanceId:,SpotId: weight=1")
             else:
                 # Node is up, but there is no associated instance (was it terminated outside of Slurm's control?)
                 # Set this node to DOWN.
@@ -245,7 +245,7 @@ def process_fleet_nodes(client, nodes, instances, spot_requests, config):
                 logger.info("Node %s is set to POWER_DOWN. Terminating linked instance %s" % (node_name, instance_id))
                 terminate_instance(client, instance_id, instance_attributes)
                 # Remove this linked node, as it is terminated.
-                common.update_node(node_name, "Comment=InstanceId:,SpotId:")
+                common.update_node(node_name, "Comment=InstanceId:,SpotId: weight=1")
         # If the underlying instance is hibernated, set it to DRAIN to prevent additional jobs from being allocated to this node.
         elif instance_attributes["State"]["Name"] == "stopped":
             if not "DRAIN" in node_states:
