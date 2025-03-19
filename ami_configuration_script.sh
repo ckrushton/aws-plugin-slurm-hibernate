@@ -117,6 +117,23 @@ EOF
 sudo patch /usr/lib/ec2-hibinit-agent/hibinit-resume /home/ubuntu/hibinit-resume.patch
 rm /home/ubuntu/hibinit-resume.patch
 
+# If AWS attempts to hibernate an instance while it is being resumed from a previous hibernation, that
+# hibernation call will be ignored.
+# To avoid this, don't start the next suspend operation until the previous one finishes.
+cat > /home/ubuntu/sleep.patch << 'EOF'
+21a22,30
+>         while true; do
+>             swapoff_running=$(sudo swapon --show=NAME | grep swap-hibinit)
+>             if [ -z $swapoff_running ]; then
+>                 break
+>             else
+>                 sleep 2
+>             fi
+>         done
+>         sleep 2
+EOF
+sudo patch /etc/acpi/actions/sleep.sh /home/ubuntu/sleep.patch
+rm /home/ubuntu/sleep.patch
 
 # Disable KASLR (see https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/hibernation-disable-kaslr.html)
 sudo sed -i '/^GRUB_CMDLINE_LINUX_DEFAULT/ s/"$/ nokaslr"/' /etc/default/grub.d/50-cloudimg-settings.cfg
