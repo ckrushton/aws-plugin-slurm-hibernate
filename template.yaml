@@ -243,9 +243,17 @@ Resources:
               EOF
               mount --all
 
-              export SLURM_HOME=/nfs/slurm
+              export SLURM_HOME=/etc/slurm SLURM_NFS_HOME=/nfs/slurm/
+              mkdir -p $SLURM_HOME/etc/aws/
               mkdir -p /var/spool/slurm
-              cp $SLURM_HOME/etc/slurm/slurmd.service /lib/systemd/system
+
+              # Copy the NFS configuration files over from the shared drive.
+              cp $SLURM_NFS_HOME/etc/gres.conf $SLURM_HOME/etc/gres.conf
+              cp $SLURM_NFS_HOME/etc/slurm.conf $SLURM_HOME/etc/slurm.conf
+              cp $SLURM_NFS_HOME/etc/aws/get_nodename $SLURM_HOME/etc/aws/get_nodename
+
+
+              cp $SLURM_NFS_HOME/etc/slurm/slurmd.service /lib/systemd/system
               systemctl enable slurmd.service
               systemctl start slurmd.service
 
@@ -319,18 +327,20 @@ Resources:
               systemctl start nfs-server
               exportfs -av
 
-              export SLURM_HOME=/nfs/slurm
+              export SLURM_HOME=/etc/slurm
+              export SLURM_NFS_HOME=/nfs/slurm
+              mkdir -p $SLURM_HOME/etc/aws/
 
-              cat > $SLURM_HOME/etc/aws/config.json <<EOF
+              cat > $SLURM_NFS_HOME/etc/aws/config.json <<EOF
               {
                   "LogLevel": "INFO",
                   "LogFileName": "/var/log/slurm_plugin.log",
                   "SlurmBinPath": "$SLURM_HOME/bin",
                   "Region": "${AWS::Region}",
                   "SlurmConf": {
-                      "PrivateData": "CLOUD",
-                     "ResumeProgram": "$SLURM_HOME/etc/aws/resume.py",
-                     "SuspendProgram": "$SLURM_HOME/etc/aws/suspend.py",
+                     "PrivateData": "CLOUD",
+                     "ResumeProgram": "$SLURM_NFS_HOME/etc/aws/resume.py",
+                     "SuspendProgram": "$SLURM_NFS_HOME/etc/aws/suspend.py",
                      "ResumeRate": 100,
                      "SuspendRate": 100,
                      "ResumeTimeout": 600,
@@ -397,7 +407,7 @@ Resources:
               }
               EOF
 
-              cat > $SLURM_HOME/etc/slurm.conf <<'EOF'
+              cat > $SLURM_NFS_HOME/etc/slurm.conf <<'EOF'
               ClusterName=amazon
               ControlMachine=@HEADNODE@
               ControlAddr=${HeadNodeNetworkInterface.PrimaryPrivateIpAddress}
@@ -434,24 +444,28 @@ Resources:
               DebugFlags=NO_CONF_HASH
               JobCompType=jobcomp/none
               EOF
-              sed -i "s|@HEADNODE@|$HOSTNAME|g" $SLURM_HOME/etc/slurm.conf
+              sed -i "s|@HEADNODE@|$HOSTNAME|g" $SLURM_NFS_HOME/etc/slurm.conf
 
               # Configure the plugin
-              mkdir -p $SLURM_HOME/etc/aws/partitions/
-              cd $SLURM_HOME/etc/aws/
-              $SLURM_HOME/etc/aws/generate_conf.py
-              cat $SLURM_HOME/etc/aws/slurm.conf.aws >> $SLURM_HOME/etc/slurm.conf
-              cp $SLURM_HOME/etc/aws/gres.conf.aws $SLURM_HOME/etc/gres.conf
+              cd $SLURM_NFS_HOME/etc/aws/
+              $SLURM_NFS_HOME/etc/aws/generate_conf.py
+              cat $SLURM_NFS_HOME/etc/aws/slurm.conf.aws >> $SLURM_NFS_HOME/etc/slurm.conf
+              cp $SLURM_NFS_HOME/etc/aws/gres.conf.aws $SLURM_NFS_HOME/etc/gres.conf
+
+              # Copy config over to local slurm install
+              cp $SLURM_NFS_HOME/etc/gres.conf $SLURM_HOME/etc/gres.conf
+              cp $SLURM_NFS_HOME/etc/slurm.conf $SLURM_HOME/etc/slurm.conf
 
               crontab -l > mycron
               cat > mycron <<EOF
-              * * * * * $SLURM_HOME/etc/aws/fleet_daemon.py &>/dev/null
+              * * * * * $SLURM_NFS_HOME/etc/aws/fleet_daemon.py &>/dev/null
               EOF
               crontab mycron
               rm mycron
 
               # Get dynamically the node name when launching slurmd
-              cat > $SLURM_HOME/etc/aws/get_nodename <<'EOF'
+              cat > $SLURM_NFS_HOME/etc/aws/get_nodename <<'EOF'
+              #/bin/bash
               instanceid=`/usr/bin/curl --fail -m 2 -s http://169.254.169.254/latest/meta-data/instance-id`
               if [[ ! -z "$instanceid" ]]; then
                  hostname=`aws ec2 describe-tags --region ${AWS::Region} --filters "Name=resource-id,Values=$instanceid" "Name=key,Values=Name" --output text | cut -f5`
@@ -466,9 +480,9 @@ Resources:
                  echo $hostname
               fi
               EOF
-              chmod +x $SLURM_HOME/etc/aws/get_nodename
+              chmod +x $SLURM_NFS_HOME/etc/aws/get_nodename
 
-              cat > $SLURM_HOME/etc/slurm/slurmd.service <<EOF
+              cat > $SLURM_NFS_HOME/etc/slurm/slurmd.service <<EOF
               [Unit]
               Description=Slurm node daemon
               After=munge.service network.target remote-fs.target
@@ -478,7 +492,8 @@ Resources:
               Type=forking
               EnvironmentFile=-/etc/sysconfig/slurmd
               ExecStartPre=/bin/bash -c "/bin/systemctl set-environment SLURM_NODENAME=\$($SLURM_HOME/etc/aws/get_nodename)"
-              ExecStart=/nfs/slurm/sbin/slurmd -N \$SLURM_NODENAME \$SLURMD_OPTIONS
+              ExecStart=$SLURM_HOME/sbin/slurmd -N \$SLURM_NODENAME \$SLURMD_OPTIONS
+              ExecStartPost=/bin/bash /lib/ec2-hibinit-agent/slurm_hib_resumejob.sh
               ExecReload=/bin/kill -HUP \$MAINPID
               PIDFile=/var/run/slurmd.pid
               KillMode=process
@@ -492,15 +507,15 @@ Resources:
               WantedBy=multi-user.target
               EOF
               
-              cat > $SLURM_HOME/etc/slurm/slurmctld.service <<EOF
+              cat > $SLURM_NFS_HOME/etc/slurm/slurmctld.service <<EOF
               [Unit]
               Description=Slurm controller daemon
               After=network.target munge.service
-              ConditionPathExists=/nfs/slurm/etc/slurm.conf
+              ConditionPathExists=$SLURM_HOME/etc/slurm.conf
               [Service]
               Type=forking
               EnvironmentFile=-/etc/sysconfig/slurmctld
-              ExecStart=/nfs/slurm/sbin/slurmctld \$SLURMCTLD_OPTIONS
+              ExecStart=$SLURM_HOME/sbin/slurmctld \$SLURMCTLD_OPTIONS
               ExecReload=/bin/kill -HUP \$MAINPID
               PIDFile=/var/run/slurmctld.pid
               LimitNOFILE=65536
@@ -520,14 +535,14 @@ Resources:
 
 
               # Set environment variables
-              echo 'export SLURM_HOME=/nfs/slurm' | tee /etc/profile.d/slurm.sh
-              echo 'export SLURM_CONF=$SLURM_HOME/etc/slurm.conf' | tee -a /etc/profile.d/slurm.sh
-              echo 'export PATH=/nfs/slurm/bin:$PATH' | tee -a /etc/profile.d/slurm.sh
+              echo 'export SLURM_HOME=/etc/slurm' | tee /etc/profile.d/slurm.sh
+              echo 'export SLURM_CONF=/etc/slurm/etc/slurm.conf' | tee -a /etc/profile.d/slurm.sh
+              echo 'export PATH=/etc/slurm/bin:$PATH' | tee -a /etc/profile.d/slurm.sh
 
               # Launch Slurmctld
               mkdir -p /var/spool/slurm
-              cp /nfs/slurm/etc/slurm/slurmd.service /lib/systemd/system
-              cp /nfs/slurm/etc/slurm/slurmctld.service /lib/systemd/system
+              cp $SLURM_NFS_HOME/etc/slurm/slurmd.service /lib/systemd/system
+              cp $SLURM_NFS_HOME/etc/slurm/slurmctld.service /lib/systemd/system
               systemctl enable slurmctld
               systemctl start slurmctld
 

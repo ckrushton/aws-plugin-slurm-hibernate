@@ -36,8 +36,9 @@ sudo chmod 777 /shared
 
 # Setup and install Slurm
 SCRATCH_INSTALL_DIR=/tmp/scratch/
-export SLURM_HOME=/nfs/slurm
-sudo mkdir -p $SCRATCH_INSTALL_DIR $SLURM_HOME
+export SLURM_HOME=/etc/slurm
+export SLURM_NFS_HOME=/nfs/slurm
+sudo mkdir -p $SCRATCH_INSTALL_DIR $SLURM_HOME $SLURM_NFS_HOME
 sudo chmod 777 $SCRATCH_INSTALL_DIR
 sudo wget --directory-prefix $SCRATCH_INSTALL_DIR -q $SLURM_TAR_URL
 sudo tar -xvf ${SCRATCH_INSTALL_DIR}/slurm-*.tar.bz2 -C ${SCRATCH_INSTALL_DIR}
@@ -53,29 +54,69 @@ sudo cp ${SCRATCH_INSTALL_DIR}/slurm-*/etc/* $SLURM_HOME/etc/slurm
 echo export PATH=${SLURM_HOME}/bin:'$PATH' >> /home/ubuntu/.bashrc
 
 # Setup Slurm EC2 plugin
-PLUGIN_DIR=$SLURM_HOME/etc/aws
+PLUGIN_DIR=$SLURM_NFS_HOME/etc/aws
 sudo mkdir -p $PLUGIN_DIR
 sudo wget --directory-prefix $PLUGIN_DIR -q ${PLUGIN_GIT_URL}common.py ${PLUGIN_GIT_URL}resume.py ${PLUGIN_GIT_URL}suspend.py ${PLUGIN_GIT_URL}generate_conf.py ${PLUGIN_GIT_URL}fleet_daemon.py
 sudo chmod +x ${PLUGIN_DIR}/*.py
 
-# Hibernation add-in script to ensure NFS is mounted before user-space processes are resumed. (i.e. running jobs)
-cat > /home/ubuntu/nfs-sync-agent <<EOF
+# Hibernation add-in script to suspend Slurm jobs before hibernating a node.
+cat > /home/ubuntu/slurm_suspend_jobs <<EOF
 #!/bin/sh
 set -e
 
 if [ "\$2" = "hibernate" ] || [ "\$2" = "hybrid-sleep" ]; then
+    jobsfile="/lib/ec2-hibinit-agent/slurm_jobs_suspended.txt"
     case "\$1" in
-        post)
-            timeout 120s ls /shared/ &>/dev/null && echo NFS online || echo NFS not mounted before timeout reached. Continuing...
-            systemctl restart slurmd
-            ;;
+        pre)
+            # To prevent any oddities with slurm jobs which are run over the network (NFS), suspend those jobs prior to hibernation.
+            $SLURM_HOME/bin/squeue --states RUNNING -w \$(bash $SLURM_HOME/etc/aws/get_nodename) --format "%i" | grep -v JOBID > \$jobsfile
+            while read job_id; do
+                # Suspend this job.
+                $SLURM_HOME/bin/scontrol suspend \$job_id
+            done < \$jobsfile
+            systemctl stop slurmd
     esac
 fi
 EOF
-sudo mv /home/ubuntu/nfs-sync-agent /lib/systemd/system-sleep/nfs-sync-agent
-sudo chown root /lib/systemd/system-sleep/nfs-sync-agent
-sudo chgrp root /lib/systemd/system-sleep/nfs-sync-agent
-sudo chmod 755 /lib/systemd/system-sleep/nfs-sync-agent
+sudo mv /home/ubuntu/slurm_suspend_jobs /lib/systemd/system-sleep/slurm_suspend_jobs
+
+# Script to resume suspended jobs following hibernation.
+cat > /home/ubuntu/slurm_hib_resumejob.sh << EOF
+#!/bin/bash
+jobfile=\$(dirname \$0)/slurm_jobs_suspended.txt
+while read job_id; do
+    # Check and determine if this job is actually running.
+    job_suspended=\$($SLURM_HOME/bin/scontrol show job | grep JobState=SUSPENDED)
+    if [[ "\$job_suspended" != "" ]]; then
+        $SLURM_HOME/bin/scontrol resume \$job_id
+    fi
+done < \$jobfile
+# Reset the job file, as we have resumed all jobs.
+rm \$jobfile
+touch \$jobfile
+EOF
+
+sudo touch /lib/ec2-hibinit-agent/slurm_jobs_suspended.txt
+sudo mv /home/ubuntu/slurm_hib_resumejob.sh /lib/ec2-hibinit-agent/slurm_hib_resumejob.sh
+sudo chown root /lib/ec2-hibinit-agent/slurm_hib_resumejob.sh /lib/systemd/system-sleep/slurm_suspend_jobs
+sudo chgrp root /lib/ec2-hibinit-agent/slurm_hib_resumejob.sh /lib/systemd/system-sleep/slurm_suspend_jobs
+sudo chmod 755 /lib/ec2-hibinit-agent/slurm_hib_resumejob.sh /lib/systemd/system-sleep/slurm_suspend_jobs
+
+# Patch the AWS EC2 hibernation agent to automatically "warm" the NFS mount before restarting networking.
+# This is used to avoid an orphan NFS connection whereby the connection becomes stale, and the client is unable to restore it as the TCP port has changed.
+cat > /home/ubuntu/hibinit-resume.patch << 'EOF'
+8d7
+< set -e
+23c22,24
+< systemctl restart --no-block systemd-networkd
+---
+> ls /shared/
+> systemctl restart systemd-networkd
+> systemctl restart --no-block slurmd
+EOF
+sudo patch /usr/lib/ec2-hibinit-agent/hibinit-resume /home/ubuntu/hibinit-resume.patch
+rm /home/ubuntu/hibinit-resume.patch
+
 
 # Disable KASLR (see https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/hibernation-disable-kaslr.html)
 sudo sed -i '/^GRUB_CMDLINE_LINUX_DEFAULT/ s/"$/ nokaslr"/' /etc/default/grub.d/50-cloudimg-settings.cfg
