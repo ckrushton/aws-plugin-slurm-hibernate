@@ -643,10 +643,10 @@ def transplate_spot_to_od(client, node_name, instance_id, config, nodegroup_pref
         logger.debug("Run Instance response - %s" % json.dumps(instance_response,indent=4,default=str))
         # Did we manage to allocate nodes?
         for instance in instance_response["Instances"]:
-            instance_id = instance["InstanceId"]
-            instance_ip = instance["PrivateIpAddress"]
-            common.update_node(node_name, "nodeaddr=%s nodehostname=%s comment=InstanceId:%s,SpotId:" % (instance_ip, node_name, instance_id))
-            update_hosts_file(node_name, instance_ip)
+            r_instance_id = instance["InstanceId"]
+            r_instance_ip = instance["PrivateIpAddress"]
+            common.update_node(node_name, "nodeaddr=%s nodehostname=%s comment=InstanceId:%s,SpotId:" % (r_instance_ip, node_name, r_instance_id))
+            update_hosts_file(node_name, r_instance_ip)
             recipient_info = instance
             break
 
